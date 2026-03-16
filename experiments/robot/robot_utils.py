@@ -20,7 +20,7 @@ DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
 # Configure NumPy print settings
-np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+np.set_printoptions(formatter={"float": lambda x: "{0:0.8f}".format(x)})
 
 # Initialize system prompt for OpenVLA v0.1
 OPENVLA_V01_SYSTEM_PROMPT = (
@@ -199,3 +199,81 @@ def invert_gripper_action(action: np.ndarray) -> np.ndarray:
     inverted_action[..., -1] *= -1.0
 
     return inverted_action
+
+
+# -------- Msgpack for VLA: Start ----------
+
+import msgpack
+import msgpack_numpy
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import requests
+import logging
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+class MsgPackHttpClientPolicy:
+    """A client policy for communicating with a VLA server using MessagePack."""
+
+    def __init__(self, host: str, port: int=None):
+        """
+        Initializes the client.
+
+        Args:
+            host (str): The server host address.
+            port (int): The server port.
+        """
+        protocol = "https" if "nat-notebook-inspire" in host or "ngrok" in host else "http"
+        if host.startswith("http"):
+            base_url = host
+        else:
+            base_url = f"{protocol}://{host}:{port}"
+        
+        self.infer_url = f"{base_url.rstrip('/')}/act"
+        self.session = requests.Session()
+        # Robust retries for occasional connection resets from server
+        retries = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.2,
+            status_forcelist=(502, 503, 504),
+            raise_on_status=False,
+            allowed_methods=frozenset(["POST", "GET"]),
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        self.session.headers.update({"Content-Type": "application/msgpack"})
+        print(f"Standalone MsgPack HTTP Client configured for: {self.infer_url}")
+
+    def infer(self, observation: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        """
+        Sends an observation to the server and returns the predicted action.
+
+        Args:
+            observation (Dict[str, Any]): The observation dictionary.
+
+        Returns:
+            Dict[str, Any]: The action dictionary from the server.
+        """
+        packed_observation = msgpack.packb(observation, default=msgpack_numpy.encode, use_bin_type=True)
+        try:
+            response = self.session.post(self.infer_url, data=packed_observation, timeout=30)
+            response.raise_for_status()
+            return msgpack.unpackb(response.content, object_hook=msgpack_numpy.decode, raw=False)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Inference request failed: {e}")
+            # Propagate exception to let the main loop handle it
+            raise e
+        except msgpack.UnpackException as e:
+            logger.error(f"Failed to unpack server response: {e}")
+            raise e
+        
+        
+# -------- Msgpack for VLA: End ----------

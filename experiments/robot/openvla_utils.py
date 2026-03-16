@@ -40,11 +40,16 @@ DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("
 OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
 
 # Configure NumPy print settings
-np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+np.set_printoptions(formatter={"float": lambda x: "{0:0.8f}".format(x)})
 
 
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Checks whether a model path points to a model on Hugging Face Hub."""
+    # Local paths should never trigger a Hub lookup; otherwise each rank can block
+    # on a pointless network probe before training starts.
+    if os.path.exists(os.path.expanduser(model_path)):
+        return False
+
     # If the API call below runs without error, the model is on the hub
     try:
         HfApi().model_info(model_path)
