@@ -23,6 +23,7 @@
 <br/>
 
 ## :loudspeaker: News!
+- **[2026/03/16]** We added **real-world ALOHA deployment** support, verified on [Cobot Magic](https://global.agilex.ai/products/cobot-magic). See [`experiments/robot/aloha/`](experiments/robot/aloha/) for details.
 - **[2025/09/22]** We released our codes! An enhanced **Pro** version is also released (this version conforms to the pipeline in the original paper, but is optimized in implementation). Everyone is welcome to use it!🎉
 - **[2025/09/13]** Our paper won the 🥇**first place** in the [daily list](https://huggingface.co/papers/date/2025-09-12), the 🥈**second place** in the [weekly list](https://huggingface.co/papers/week/2025-W37), and 🥉**third place** in the [Monthly list](https://huggingface.co/papers/month/2025-09) in HF! ⭐
 - **[2025/09/13]** Our paper listed in the [Trending Paper](https://huggingface.co/papers/trending) in HF! ⭐
@@ -36,6 +37,7 @@
 - [x]  Release **checkpoints** for reproduction.
 - [x]  Release [VLA-Adapter v2 paper](https://arxiv.org/abs/2509.09372).
 - [ ]  A more **powerful version**, **VLA-Adapter++**, and a detailed **technical report** 📝 will be released soon.<br/>
+- [x]  **ALOHA real-world deployment** on [Cobot Magic](https://global.agilex.ai/products/cobot-magic) — training, server-client inference, and evaluation ([details](experiments/robot/aloha/)).<br/>
 - [ ]  Continue to update the code to adapt to various **real-world systems** deployments, including the configuration of our paper, Franka, UR-5, and AGILE Piper.<br/>
 - [ ]  It will soon be compatible with **various foundation models**, including but not limited to [VPP](https://arxiv.org/abs/2412.14803), [π0.5](https://arxiv.org/abs/2504.16054).<br/>
 - [ ]  We will update the **diffusion transformers** and **flow matching** policy networks in the future, and the results will be updated in the subsequent VLA-Adapter++ technical report.
