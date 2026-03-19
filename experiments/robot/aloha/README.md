@@ -1,3 +1,19 @@
+<div align="center">
+
+## Demo
+
+<video src="https://github.com/user-attachments/assets/63538db5-c776-40d9-8909-802e4c599eef" controls width="80%"></video>
+
+<br>
+
+**Sandwich Assembly** &mdash; Pick bread from rack &rarr; place on tray &rarr; add lettuce &rarr; add ham &rarr; cover with bread
+
+<sub>Cobot Magic &nbsp;|&nbsp; Bimanual 14-DOF &nbsp;|&nbsp; 3-Camera &nbsp;|&nbsp; 2&times; Speed</sub>
+
+</div>
+
+---
+
 # ALOHA Real-World
 
 Training, deployment, and evaluation pipeline for the ALOHA bimanual robot. For base installation, see the project root [`README.md`](../../../README.md). Successfully verified on [Cobot Magic](https://global.agilex.ai/products/cobot-magic).
