@@ -39,6 +39,13 @@ CALVIN_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+PICK_PLACE_CONVEYOR_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 16,
+    "ACTION_DIM": 8,
+    "PROPRIO_DIM": 8,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
+
 ALOHA_CONSTANTS = {
     "NUM_ACTIONS_CHUNK": 25,
     "ACTION_DIM": 14,
@@ -66,6 +73,8 @@ def detect_robot_platform():
         return "BRIDGE"
     elif "calvin" in cmd_args:
         return "CALVIN"
+    elif "pick_place_conveyor" in cmd_args:
+        return "PICK_PLACE_CONVEYOR"
     else:
         # Default to LIBERO if unclear
         return "LIBERO"
@@ -83,6 +92,8 @@ elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
 elif ROBOT_PLATFORM == "CALVIN":
     constants = CALVIN_CONSTANTS
+elif ROBOT_PLATFORM == "PICK_PLACE_CONVEYOR":
+    constants = PICK_PLACE_CONVEYOR_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]

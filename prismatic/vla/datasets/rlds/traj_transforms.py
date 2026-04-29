@@ -21,10 +21,17 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     action, and `future_action_window_size` actions from the future. "pad_mask" is added to "observation" and
     indicates whether an observation should be considered padding (i.e. if it had come from a timestep
     before the start of the trajectory).
+
+    Every timestep in the trajectory becomes a training sample. When the current step is close enough to the
+    end of the episode that the future-action window would run past the last frame, the out-of-range future
+    indices are clamped to the final frame of the episode (i.e. the last action is repeated for those
+    positions) instead of dropping the sample. A top-level "pad_mask_future_actions" tensor (shape
+    [traj_len, window_size + future_action_window_size]) is added to indicate which action positions are
+    backed by real data versus filled by clamping.
     """
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
-    effective_traj_len = traj_len - future_action_window_size
+    effective_traj_len = traj_len
     chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
     )
@@ -41,6 +48,7 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
 
     goal_timestep = tf.fill([effective_traj_len], traj_len - 1)
 
+    # Clamp out-of-range action indices: negatives -> first frame, beyond-end -> last frame (repeat last action).
     floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), goal_timestep[:, None])
 
     traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])
@@ -48,6 +56,9 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
 
     # indicates whether an entire observation is padding
     traj["observation"]["pad_mask"] = chunk_indices >= 0
+
+    # True for action positions backed by real data; False where the index was clamped to the last frame.
+    traj["pad_mask_future_actions"] = action_chunk_indices <= goal_timestep[:, None]
 
     # Truncate other elements of the trajectory dict
     traj["task"] = tf.nest.map_structure(lambda x: tf.gather(x, tf.range(effective_traj_len)), traj["task"])

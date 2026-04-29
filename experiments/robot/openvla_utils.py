@@ -284,7 +284,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     Returns:
         torch.nn.Module: The initialized VLA model
     """
-    print("Instantiating pretrained VLA policy...")
+    print("Instantiating pretrained VLA policy...", flush=True)
 
     # If loading a locally stored pretrained checkpoint, check whether config or model files
     # need to be synced so that any changes the user makes to the VLA modeling code will
@@ -298,11 +298,13 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
+        print("[openvla_utils] registering local OpenVLA classes and syncing config/model files", flush=True)
         # Update config.json and sync model files
         update_auto_map(cfg.pretrained_checkpoint)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
     # Load the model
+    print("[openvla_utils] AutoModelForVision2Seq.from_pretrained start", flush=True)
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
         # attn_implementation="flash_attention_2",
@@ -312,9 +314,11 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         low_cpu_mem_usage=False,
         trust_remote_code=False,
     )
+    print("[openvla_utils] AutoModelForVision2Seq.from_pretrained done", flush=True)
 
     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
+        print("[openvla_utils] applying FiLM wrapper", flush=True)
         vla = _apply_film_to_vla(vla, cfg)
 
     # Set number of images in model input
@@ -324,10 +328,13 @@ def get_vla(cfg: Any) -> torch.nn.Module:
 
     # Move model to device if not using quantization
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
+        print(f"[openvla_utils] moving VLA model to {DEVICE}", flush=True)
         vla = vla.to(DEVICE)
 
     # Load dataset stats for action normalization
+    print("[openvla_utils] loading dataset statistics", flush=True)
     _load_dataset_stats(vla, cfg.pretrained_checkpoint)
+    print("[openvla_utils] VLA model ready", flush=True)
 
     return vla
 

@@ -852,11 +852,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             # Get hidden states for text portion of prompt+response (after the vision patches)
             text_hidden_states = item
             # Get hidden states for action portion of response
-            batch_size = item.shape[0]
-            actions_hidden_states = text_hidden_states[
-                :, NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + NUM_TOKENS, :,
-            ].reshape(batch_size, 1, NUM_TOKENS, -1).to(torch.bfloat16)
+            actions_hidden_states = text_hidden_states[:, NUM_PATCHES+ NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + NUM_TOKENS, :,].reshape(1, 1, NUM_TOKENS, -1).to(torch.bfloat16)
             
+            batch_size = item.shape[0]
             task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
             all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
             multi_layer_hidden_states.append(all_hidden_states)
@@ -870,7 +868,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = action_head.predict_action(multi_layer_hidden_states,
                                                 proprio=proprio,
                                                 proprio_projector=proprio_projector)
-            normalized_actions = normalized_actions.reshape(input_embeddings.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM)
+            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
             # Discrete token-based prediction
@@ -886,7 +884,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             discretized_actions = self.vocab_size - predicted_action_token_ids
             discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
             normalized_actions = self.bin_centers[discretized_actions]
-            normalized_actions = normalized_actions.reshape(input_embeddings.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM)
+            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
         return normalized_actions, actions_hidden_states
 

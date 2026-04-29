@@ -116,8 +116,8 @@ class FinetuneConfig:
     use_fz: bool = False                             # If True, uses LoRA fine-tuning
 
     # Logging
-    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
-    wandb_project: str = "your-wandb-project"        # Name of WandB project
+    wandb_entity: str = "cyx0307-shanghai-jiao-tong-university"          # Name of WandB entity
+    wandb_project: str = "vla-adapter"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
@@ -992,7 +992,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         collate_fn=collator,
         num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
     )
-    print('Len of dataloader: ', len(dataloader))
+    # RLDSDataset is an IterableDataset backed by a repeated TF pipeline.
+    # Calling len(dataloader) sets an expected hard cap in PyTorch and can trigger
+    # warnings once more samples are consumed than the estimated epoch length.
+    estimated_steps_per_epoch = max(1, train_dataset.dataset_length // cfg.batch_size)
+    print(f"Estimated dataloader steps/epoch: {estimated_steps_per_epoch}")
     if cfg.use_val_set:
         val_batch_size = cfg.batch_size
         val_dataloader = DataLoader(

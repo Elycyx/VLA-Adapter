@@ -684,6 +684,13 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
+    "pick_place_conveyor": {
+        "image_obs_keys": {"primary": "fixed_cam", "secondary": None, "wrist": "wrist_cam"},
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": ["state"],
+        "state_encoding": StateEncoding.JOINT,
+        "action_encoding": ActionEncoding.JOINT_POS,
+    },
     "libero_4_task_suites_no_noops": {
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": "wrist_image"},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
