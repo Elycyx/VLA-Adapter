@@ -87,6 +87,7 @@ prismatic/vla/constants.py
 prismatic/vla/materialize.py
 prismatic/vla/datasets/__init__.py
 prismatic/vla/datasets/datasets.py
+prismatic/vla/datasets/dinov3_features.py
 prismatic/vla/datasets/rlds/__init__.py
 prismatic/vla/datasets/rlds/dataset.py
 prismatic/vla/datasets/rlds/obs_transforms.py
@@ -113,6 +114,7 @@ vla-scripts/deploy.py
 vla-scripts/evaluate_calvin.py
 vla-scripts/finetune.py
 vla-scripts/merge_lora_weights_and_save.py
+vla-scripts/precompute_dinov3_features.py
 vla-scripts/train.py
 vla-scripts/vla_evaluation.py
 vla-scripts/extern/convert_openvla_weights_to_hf.py

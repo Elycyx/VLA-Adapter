@@ -35,6 +35,39 @@ overwatch = initialize_overwatch(__name__)
 tf.config.set_visible_devices([], "GPU")
 
 
+def parse_relative_action_mask(mask):
+    if mask is None:
+        return None
+    if isinstance(mask, str):
+        if not mask.strip():
+            return None
+        truthy = {"1", "true", "t", "yes", "y"}
+        falsy = {"0", "false", "f", "no", "n"}
+        parsed = []
+        for item in mask.split(","):
+            value = item.strip().lower()
+            if value in truthy:
+                parsed.append(True)
+            elif value in falsy:
+                parsed.append(False)
+            else:
+                raise ValueError(f"Invalid relative_action_mask value: {item!r}")
+        return tuple(parsed)
+    return tuple(bool(x) for x in mask)
+
+
+def _add_action_normalization_mask(dataset_statistics: dict, action_normalization_mask: Optional[List[bool]]) -> dict:
+    if action_normalization_mask is None:
+        return dataset_statistics
+    if len(action_normalization_mask) != dataset_statistics["action"]["mean"].shape[-1]:
+        raise ValueError(
+            f"Length of skip_normalization_mask ({len(action_normalization_mask)}) "
+            f"does not match action dimension ({dataset_statistics['action']['mean'].shape[-1]})."
+        )
+    dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
+    return dataset_statistics
+
+
 # ruff: noqa: B006
 def make_dataset_from_rlds(
     name: str,
@@ -51,6 +84,8 @@ def make_dataset_from_rlds(
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
+    use_relative_action: bool = False,
+    relative_action_mask: Optional[List[bool]] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -110,6 +145,11 @@ def make_dataset_from_rlds(
         action_normalization_mask (Sequence[bool], optional): If provided, indicates which action dimensions
             should be normalized. For example, you might not want to normalize the gripper action dimension if
             it's always exactly 0 or 1. By default, all action dimensions are normalized.
+        use_relative_action (bool, optional): If True, action chunks are converted to deltas against the current
+            proprioceptive state during trajectory transforms, before computing relative-action statistics and
+            normalization.
+        relative_action_mask (Sequence[bool], optional): Mask of action/state dimensions to convert to relative
+            action space. Matches OpenPI DeltaActions semantics: action[..., i] -= state[..., i] where True.
         num_parallel_reads (int): number of parallel read workers. Default to AUTOTUNE.
         num_parallel_calls (int): number of parallel calls for traj_map operations. Default to AUTOTUNE.
     Returns:
@@ -127,6 +167,9 @@ def make_dataset_from_rlds(
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
         REQUIRED_KEYS.add(language_key)
+    relative_action_mask = parse_relative_action_mask(relative_action_mask)
+    if use_relative_action and relative_action_mask is None:
+        raise ValueError("use_relative_action=True requires relative_action_mask.")
 
     def restructure(traj):
         # apply a standardization function, if provided
@@ -216,19 +259,15 @@ def make_dataset_from_rlds(
                 str(builder.info),
                 str(state_obs_keys),
                 inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+                str(use_relative_action),
+                str(relative_action_mask),
             ),
             save_dir=builder.data_dir,
         )
     dataset_statistics = tree_map(np.array, dataset_statistics)
 
     # skip normalization for certain action dimensions
-    if action_normalization_mask is not None:
-        if len(action_normalization_mask) != dataset_statistics["action"]["mean"].shape[-1]:
-            raise ValueError(
-                f"Length of skip_normalization_mask ({len(action_normalization_mask)}) "
-                f"does not match action dimension ({dataset_statistics['action']['mean'].shape[-1]})."
-            )
-        dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
+    dataset_statistics = _add_action_normalization_mask(dataset_statistics, action_normalization_mask)
 
     # construct the dataset
     split = "train" if train else "val"
@@ -236,14 +275,15 @@ def make_dataset_from_rlds(
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
-    dataset = dataset.traj_map(
-        partial(
-            normalize_action_and_proprio,
-            metadata=dataset_statistics,
-            normalization_type=action_proprio_normalization_type,
-        ),
-        num_parallel_calls,
-    )
+    if not use_relative_action:
+        dataset = dataset.traj_map(
+            partial(
+                normalize_action_and_proprio,
+                metadata=dataset_statistics,
+                normalization_type=action_proprio_normalization_type,
+            ),
+            num_parallel_calls,
+        )
 
     return dataset, dataset_statistics
 
@@ -256,12 +296,15 @@ def apply_trajectory_transforms(
     goal_relabeling_kwargs: dict = {},
     window_size: int = 1,
     future_action_window_size: int = 0,
+    future_obs_window_size: int = 0,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
     max_proprio: Optional[float] = None,
     task_augment_strategy: Optional[str] = None,
     task_augment_kwargs: dict = {},
+    use_relative_action: bool = False,
+    relative_action_mask: Optional[List[bool]] = None,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> dl.DLataset:
     """
@@ -335,9 +378,22 @@ def apply_trajectory_transforms(
             traj_transforms.chunk_act_obs,
             window_size=window_size,
             future_action_window_size=future_action_window_size,
+            future_obs_window_size=future_obs_window_size,
         ),
         num_parallel_calls,
     )
+
+    if use_relative_action:
+        relative_action_mask = parse_relative_action_mask(relative_action_mask)
+        if relative_action_mask is None:
+            raise ValueError("use_relative_action=True requires relative_action_mask.")
+        dataset = dataset.traj_map(
+            partial(
+                traj_transforms.make_actions_relative_to_current_state,
+                relative_action_mask=relative_action_mask,
+            ),
+            num_parallel_calls,
+        )
 
     if train and subsample_length is not None:
         dataset = dataset.traj_map(
@@ -409,6 +465,18 @@ def apply_frame_transforms(
         num_parallel_calls,
     )
 
+    # Decode + resize the top-level `image_primary_future` (used by the optional future-vision
+    # prediction branch). Skipped when `image_primary_future` is absent (no-op).
+    if isinstance(resize_size, dict):
+        future_resize_size = resize_size.get("primary", None)
+    else:
+        future_resize_size = resize_size
+    if future_resize_size is not None:
+        dataset = dataset.frame_map(
+            partial(obs_transforms.decode_and_resize_future_obs, resize_size=future_resize_size),
+            num_parallel_calls,
+        )
+
     if train:
         # Augment all images with the same seed, skipping padding images
         def aug(frame: dict):
@@ -441,6 +509,31 @@ def make_single_dataset(
         train=train,
     )
     dataset = apply_trajectory_transforms(dataset, **traj_transform_kwargs, train=train)
+    if dataset_kwargs.get("use_relative_action", False):
+        dataset_statistics = get_dataset_statistics(
+            dataset,
+            hash_dependencies=(
+                str(dataset_kwargs["name"]),
+                str(dataset_kwargs.get("data_dir", "")),
+                inspect.getsource(dataset_kwargs["standardize_fn"]) if dataset_kwargs.get("standardize_fn") else "",
+                str(traj_transform_kwargs),
+                "openpi_relative_action_v2",
+                str(parse_relative_action_mask(dataset_kwargs.get("relative_action_mask"))),
+            ),
+            save_dir=dataset_kwargs.get("data_dir"),
+        )
+        dataset_statistics = tree_map(np.array, dataset_statistics)
+        dataset_statistics = _add_action_normalization_mask(
+            dataset_statistics,
+            dataset_kwargs.get("action_normalization_mask"),
+        )
+        dataset = dataset.traj_map(
+            partial(
+                normalize_action_and_proprio,
+                metadata=dataset_statistics,
+                normalization_type=dataset_kwargs["action_proprio_normalization_type"],
+            )
+        )
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
 
     # this seems to reduce memory usage without affecting speed
@@ -504,7 +597,30 @@ def make_interleaved_dataset(
         data_kwargs = copy.deepcopy(dataset_kwargs)
         if "dataset_frame_transform_kwargs" in data_kwargs:
             data_kwargs.pop("dataset_frame_transform_kwargs")
-        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
+        stats_dataset, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
+        if data_kwargs.get("use_relative_action", False):
+            stats_dataset = apply_trajectory_transforms(
+                stats_dataset,
+                **traj_transform_kwargs,
+                train=train,
+            )
+            dataset_statistics = get_dataset_statistics(
+                stats_dataset,
+                hash_dependencies=(
+                    str(data_kwargs["name"]),
+                    str(data_kwargs.get("data_dir", "")),
+                    inspect.getsource(data_kwargs["standardize_fn"]) if data_kwargs.get("standardize_fn") else "",
+                    str(traj_transform_kwargs),
+                    "openpi_relative_action_v2",
+                    str(parse_relative_action_mask(data_kwargs.get("relative_action_mask"))),
+                ),
+                save_dir=data_kwargs.get("data_dir"),
+            )
+            dataset_statistics = tree_map(np.array, dataset_statistics)
+            dataset_statistics = _add_action_normalization_mask(
+                dataset_statistics,
+                data_kwargs.get("action_normalization_mask"),
+            )
         dataset_sizes.append(dataset_statistics["num_transitions"])
         all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
@@ -553,7 +669,17 @@ def make_interleaved_dataset(
             **traj_transform_kwargs,
             num_parallel_calls=threads,
             train=train,
-        ).flatten(num_parallel_calls=threads)
+        )
+        if dataset_kwargs.get("use_relative_action", False):
+            dataset = dataset.traj_map(
+                partial(
+                    normalize_action_and_proprio,
+                    metadata=all_dataset_statistics[dataset_kwargs["name"]],
+                    normalization_type=dataset_kwargs["action_proprio_normalization_type"],
+                ),
+                threads,
+            )
+        dataset = dataset.flatten(num_parallel_calls=threads)
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
         datasets.append(dataset)
 

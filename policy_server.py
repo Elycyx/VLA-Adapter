@@ -56,7 +56,7 @@ class ServerConfig:
     unnorm_key: str = ""
     control_mode: str = "joint_pos"
     num_images_in_input: int = 2
-    action_horizon: int = 16
+    action_horizon: int = 8
     action_dim: int = 8
     proprio_dim: int = 8
     use_proprio: bool = True
@@ -65,6 +65,9 @@ class ServerConfig:
     use_film: bool = False
     use_minivlm: bool = True
     use_pro_version: bool = True
+    use_future_pred: bool = False
+    use_relative_action: bool = False
+    relative_action_mask: str | tuple[bool, ...] | list[bool] | None = None
     center_crop: bool = False
     load_in_8bit: bool = False
     load_in_4bit: bool = False
@@ -84,6 +87,8 @@ _SAVE_MODEL_IMAGES_LOCK = threading.Lock()
 class VLAAdapterPolicy:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
+        if cfg.use_relative_action and cfg.relative_action_mask is None:
+            raise ValueError("--use_relative_action requires --relative_action_mask.")
         self.device = torch.device(cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
 
         # Import after parsing robot_platform so prismatic.vla.constants chooses
@@ -94,6 +99,7 @@ class VLAAdapterPolicy:
 
         openvla_utils.DEVICE = self.device
         from experiments.robot.openvla_utils import (
+            absolute_actions_from_relative,
             get_action_head,
             get_noisy_action_projector,
             get_processor,
@@ -105,6 +111,7 @@ class VLAAdapterPolicy:
         )
 
         _status("loading main VLA model")
+        self._absolute_actions_from_relative = absolute_actions_from_relative
         self._get_vla_action = get_vla_action
         self._normalize_proprio = normalize_proprio
         self._prepare_images_for_vla = prepare_images_for_vla
@@ -118,6 +125,36 @@ class VLAAdapterPolicy:
         if cfg.use_proprio:
             _status("loading proprio projector")
             self.proprio_projector = get_proprio_projector(cfg, self.model.llm_dim, proprio_dim=cfg.proprio_dim)
+
+        if cfg.use_future_pred:
+            _status("loading future-prediction components and enabling future-pred branch")
+            from experiments.robot.openvla_utils import find_checkpoint_file
+
+            try:
+                ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "pred_components")
+            except AssertionError as exc:
+                raise FileNotFoundError(
+                    "--use_future_pred was set, but this checkpoint does not contain "
+                    "`pred_components--*_checkpoint.pt`. Use a checkpoint trained with "
+                    "`--use_future_pred True`, or remove `--use_future_pred` for this checkpoint."
+                ) from exc
+            _status(f"loading pred_components from {ckpt_path}")
+            state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            self.model.pred_queries.load_state_dict(state["pred_queries"])
+            pred_head_state = state["pred_head"]
+            if "weight" not in pred_head_state and "base_layer.weight" in pred_head_state:
+                # Backward compatibility for early checkpoints where pred_head was accidentally
+                # LoRA-wrapped by target_modules="all-linear". Training used lora_alpha=2*r, so
+                # the PEFT scaling is alpha / r = 2. Merge it into the base Linear weight.
+                base_weight = pred_head_state["base_layer.weight"]
+                lora_a = pred_head_state["lora_A.default.weight"]
+                lora_b = pred_head_state["lora_B.default.weight"]
+                pred_head_state = {"weight": base_weight + 2.0 * (lora_b @ lora_a)}
+            self.model.pred_head.load_state_dict(pred_head_state)
+            self.model.pred_queries.to(self.device, dtype=torch.bfloat16)
+            self.model.pred_head.to(self.device, dtype=torch.bfloat16)
+            self.model.set_use_future_pred(True)
+            _status("future-pred branch enabled")
 
         self.action_head = None
         if cfg.use_l1_regression or cfg.use_diffusion:
@@ -164,6 +201,9 @@ class VLAAdapterPolicy:
             "proprio_dim": self.cfg.proprio_dim,
             "unnorm_key": self.unnorm_key,
             "num_images_in_input": self.cfg.num_images_in_input,
+            "use_relative_action": self.cfg.use_relative_action,
+            "relative_action_mask": self.cfg.relative_action_mask,
+            "use_future_pred": self.cfg.use_future_pred,
         }
 
     def predict_one(self, request: dict[str, Any], env_idx: int) -> np.ndarray:
@@ -183,7 +223,7 @@ class VLAAdapterPolicy:
                 f"Request supplied {len(obs)} image(s), but the model expects {self.cfg.num_images_in_input}."
             )
 
-        if self.cfg.use_proprio:
+        if self.cfg.use_proprio or self.cfg.use_relative_action:
             obs["state"] = _build_proprio_state(request, env_idx)
 
         if self.cfg.save_model_images:
@@ -264,10 +304,12 @@ class VLAAdapterPolicy:
                 inputs["pixel_values"] = torch.cat([inputs["pixel_values"]] + wrist_pixel_values, dim=1)
 
             proprio = None
+            proprio_raw = None
+            if self.cfg.use_proprio or self.cfg.use_relative_action:
+                proprio_raw = np.stack([_build_proprio_state(request, i) for i in range(num_envs)], axis=0)
             if self.cfg.use_proprio:
-                proprio = np.stack([_build_proprio_state(request, i) for i in range(num_envs)], axis=0)
                 proprio_norm_stats = self.model.norm_stats[self.cfg.unnorm_key]["proprio"]
-                proprio = self._normalize_proprio(proprio, proprio_norm_stats)
+                proprio = self._normalize_proprio(proprio_raw, proprio_norm_stats)
 
             if self.cfg.debug:
                 logger.info(
@@ -287,6 +329,11 @@ class VLAAdapterPolicy:
                 action_head=self.action_head,
                 use_film=self.cfg.use_film,
             )
+
+        if self.cfg.use_relative_action:
+            if proprio_raw is None:
+                raise ValueError("use_relative_action=True requires proprio state in request.")
+            actions = self._absolute_actions_from_relative(actions, proprio_raw, self.cfg.relative_action_mask)
 
         action_batch = _ensure_action_batch(
             np.asarray(actions, dtype=np.float32),
@@ -555,6 +602,13 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--use_film", action=argparse.BooleanOptionalAction, default=CONFIG.use_film)
     parser.add_argument("--use_minivlm", action=argparse.BooleanOptionalAction, default=CONFIG.use_minivlm)
     parser.add_argument("--use_pro_version", action=argparse.BooleanOptionalAction, default=CONFIG.use_pro_version)
+    parser.add_argument("--use_future_pred", action=argparse.BooleanOptionalAction, default=CONFIG.use_future_pred)
+    parser.add_argument("--use_relative_action", action=argparse.BooleanOptionalAction, default=CONFIG.use_relative_action)
+    parser.add_argument(
+        "--relative_action_mask",
+        default=CONFIG.relative_action_mask,
+        help="Comma-separated bool mask, e.g. true,true,true,true,true,true,true,false",
+    )
     parser.add_argument("--center_crop", action=argparse.BooleanOptionalAction, default=CONFIG.center_crop)
     parser.add_argument("--load_in_8bit", action=argparse.BooleanOptionalAction, default=CONFIG.load_in_8bit)
     parser.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=CONFIG.load_in_4bit)

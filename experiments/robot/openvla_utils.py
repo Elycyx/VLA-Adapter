@@ -713,6 +713,62 @@ def normalize_proprio(proprio: np.ndarray, norm_stats: Dict[str, Any]) -> np.nda
     return normalized_proprio
 
 
+def parse_relative_action_mask(mask: Any) -> Optional[Tuple[bool, ...]]:
+    """Parse a configurable bool mask from tuple/list or comma-separated CLI string."""
+    if mask is None:
+        return None
+    if isinstance(mask, str):
+        if not mask.strip():
+            return None
+        truthy = {"1", "true", "t", "yes", "y"}
+        falsy = {"0", "false", "f", "no", "n"}
+        parsed = []
+        for item in mask.split(","):
+            value = item.strip().lower()
+            if value in truthy:
+                parsed.append(True)
+            elif value in falsy:
+                parsed.append(False)
+            else:
+                raise ValueError(f"Invalid relative_action_mask value: {item!r}")
+        return tuple(parsed)
+    return tuple(bool(x) for x in mask)
+
+
+def absolute_actions_from_relative(actions: np.ndarray, state: np.ndarray, mask: Any) -> np.ndarray:
+    """
+    Convert OpenPI-style delta actions back to absolute actions for selected dimensions.
+
+    For mask=True dimensions, this performs actions[..., i] += state[..., i]. Supports unbatched
+    [horizon, action_dim] actions with [state_dim] state and batched [batch, horizon, action_dim]
+    actions with [batch, state_dim] state.
+    """
+    parsed_mask = parse_relative_action_mask(mask)
+    if parsed_mask is None:
+        return actions
+
+    actions = np.asarray(actions, dtype=np.float32).copy()
+    state = np.asarray(state, dtype=np.float32)
+    mask_array = np.asarray(parsed_mask, dtype=bool)
+    dims = len(parsed_mask)
+
+    if actions.ndim == 2 and state.ndim == 2:
+        if state.shape[0] != 1:
+            raise ValueError("Batched state requires batched actions.")
+        state = state[0]
+    elif actions.ndim == 3 and state.ndim == 1:
+        state = np.broadcast_to(state, (actions.shape[0], state.shape[-1]))
+
+    if dims > actions.shape[-1]:
+        raise ValueError(f"relative_action_mask length ({dims}) exceeds action dimension ({actions.shape[-1]}).")
+    if dims > state.shape[-1]:
+        raise ValueError(f"relative_action_mask length ({dims}) exceeds state dimension ({state.shape[-1]}).")
+
+    state_delta = np.where(mask_array, state[..., :dims], 0.0)
+    actions[..., :dims] += np.expand_dims(state_delta, axis=-2)
+    return actions
+
+
 def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Image]:
     """
     Prepare images for VLA input by resizing and cropping as needed.
@@ -809,6 +865,11 @@ def get_vla_action(
 
         # Process proprioception data if used
         proprio = None
+        raw_state = None
+        if getattr(cfg, "use_relative_action", False):
+            if "state" not in obs:
+                raise ValueError("use_relative_action=True requires obs['state'] for output conversion.")
+            raw_state = np.asarray(obs["state"], dtype=np.float32).copy()
         if cfg.use_proprio:
             proprio = obs["state"]
             proprio_norm_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
@@ -832,6 +893,9 @@ def get_vla_action(
                 action_head=action_head,
                 use_film=use_film,
             )
+
+        if getattr(cfg, "use_relative_action", False):
+            action = absolute_actions_from_relative(action, raw_state, cfg.relative_action_mask)
 
     # Extract subset of actions for open loop steps
     return [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]

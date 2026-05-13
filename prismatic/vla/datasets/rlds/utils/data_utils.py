@@ -229,6 +229,8 @@ def get_dataset_statistics(
         num_trajectories += 1
 
     actions, proprios = np.concatenate(actions), np.concatenate(proprios)
+    actions = actions.reshape(-1, actions.shape[-1])
+    proprios = proprios.reshape(-1, proprios.shape[-1])
     metadata = {
         "action": {
             "mean": actions.mean(0).tolist(),

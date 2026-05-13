@@ -13,6 +13,45 @@ import tensorflow as tf
 from absl import logging
 
 
+def decode_and_resize_future_obs(frame: Dict, resize_size: Tuple[int, int]) -> Dict:
+    """Decodes and resizes the top-level `image_primary_future` field used by the
+    optional future-vision prediction branch. We deliberately keep this OUT of
+    the per-observation `dl.vmap(decode_and_resize)` pipeline because future
+    obs has a different leading dim (chunk_size) than `image_primary`
+    (window_size), which would break dl.vmap.
+
+    No augmentation is applied to keep the supervision target stable.
+    """
+    if "image_primary_future" not in frame:
+        return frame
+
+    imgs = frame["image_primary_future"]  # (chunk, H_or_string, W?, ?)
+
+    if imgs.dtype == tf.string:
+        def _decode_one(img_bytes: tf.Tensor) -> tf.Tensor:
+            # `tf.map_fn` may pass each row as rank-1 (e.g. shape [1]); `tf.io.decode_image`
+            # requires a scalar string (rank 0).
+            img_bytes = tf.squeeze(img_bytes)
+            img_bytes = tf.reshape(img_bytes, ())
+            return tf.cond(
+                tf.equal(tf.strings.length(img_bytes), 0),
+                lambda: tf.zeros((*resize_size, 3), dtype=tf.uint8),
+                lambda: dl.transforms.resize_image(
+                    tf.io.decode_image(img_bytes, expand_animations=False, dtype=tf.uint8),
+                    size=resize_size,
+                ),
+            )
+
+        imgs = tf.map_fn(_decode_one, imgs, fn_output_signature=tf.uint8)
+    elif imgs.dtype == tf.uint8:
+        imgs = dl.vmap(lambda x: dl.transforms.resize_image(x, size=resize_size))(imgs)
+    else:
+        raise ValueError(f"Unsupported `image_primary_future` dtype: {imgs.dtype}")
+
+    frame["image_primary_future"] = imgs
+    return frame
+
+
 # ruff: noqa: B023
 def augment(obs: Dict, seed: tf.Tensor, augment_kwargs: Union[Dict, Dict[str, Dict]]) -> Dict:
     """Augments images, skipping padding images."""

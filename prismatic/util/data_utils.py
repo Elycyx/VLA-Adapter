@@ -172,4 +172,17 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+
+        # Future-vision prediction extras (optional). All instances either provide them or none do.
+        if "pred_mask" in instances[0]:
+            pred_masks = [instance["pred_mask"] for instance in instances]
+            pred_mask = pad_sequence(pred_masks, batch_first=True, padding_value=False)
+            pred_mask = pred_mask[:, : self.model_max_length]
+            output["pred_mask"] = pred_mask
+            output["future_pred_features"] = torch.stack(
+                [instance["future_pred_features"] for instance in instances]
+            )
+            output["future_pad_mask"] = torch.stack(
+                [instance["future_pad_mask"] for instance in instances]
+            )
         return output

@@ -40,7 +40,7 @@ CALVIN_CONSTANTS = {
 }
 
 PICK_PLACE_CONVEYOR_CONSTANTS = {
-    "NUM_ACTIONS_CHUNK": 16,
+    "NUM_ACTIONS_CHUNK": 8,
     "ACTION_DIM": 8,
     "PROPRIO_DIM": 8,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
@@ -100,6 +100,11 @@ NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
 ACTION_DIM = constants["ACTION_DIM"]
 PROPRIO_DIM = constants["PROPRIO_DIM"]
 ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
+
+# Number of predictive tokens for the (optional) future-vision prediction branch.
+# Each token is supervised against the latent feature of one future observation step.
+NUM_PRED_TOKENS = NUM_ACTIONS_CHUNK
+DINO_V3_FEATURE_DIM = 1024
 
 # Print which robot platform constants are being used (for debugging)
 print(f"Using {ROBOT_PLATFORM} constants:")

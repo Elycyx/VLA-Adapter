@@ -6,7 +6,9 @@ Fine-tunes Qwen2.5-0.5B via LoRA.
 
 import os
 import time
+import inspect
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
@@ -50,7 +52,9 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    DINO_V3_FEATURE_DIM,
     NUM_ACTIONS_CHUNK,
+    NUM_PRED_TOKENS,
     PROPRIO_DIM,
     NUM_TOKENS
 )
@@ -84,6 +88,8 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_relative_action: bool = False                # If True, train selected action dims as action - state deltas
+    relative_action_mask: Optional[str] = None        # Comma-separated bool mask, e.g. true,true,false
     phase1_path: str = "None"
 
     # Training configuration
@@ -125,6 +131,12 @@ class FinetuneConfig:
     # revision version
     use_pro_version: bool = True                             # the version number
     phase: str = "Training"
+
+    # Future-vision prediction (optional, requires `use_pro_version=True`)
+    use_future_pred: bool = False                    # If True, adds NUM_PRED_TOKENS predictive tokens
+                                                     # supervised against cached DINOv3 future-obs features.
+    future_pred_feature_dir: Optional[Path] = None   # Directory produced by precompute_dinov3_features.py.
+    future_pred_loss_weight: float = 1.0             # Weight for the DINOv3 cosine alignment term.
     # fmt: on
 
 
@@ -153,6 +165,17 @@ def remove_ddp_in_checkpoint(state_dict) -> dict:
             new_state_dict[k] = v
     return new_state_dict
 
+
+def _lora_target_linear_suffixes_excluding(module: nn.Module, exclude_name_substrings: Tuple[str, ...]) -> list[str]:
+    """Unique last-name segments of `nn.Linear` layers for PEFT `target_modules`, skipping given name substrings."""
+    suffixes: set[str] = set()
+    for name, mod in module.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        if any(s in name for s in exclude_name_substrings):
+            continue
+        suffixes.add(name.rsplit(".", 1)[-1])
+    return sorted(suffixes)
 
 
 def get_run_id(cfg) -> str:
@@ -186,6 +209,8 @@ def get_run_id(cfg) -> str:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
         if cfg.image_aug:
             run_id += "--image_aug"
+        if cfg.use_relative_action:
+            run_id += "--relative_action"
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
@@ -331,8 +356,15 @@ def run_forward_pass(
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
     noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
-    # VLA forward pass
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    use_future_pred = bool(cfg is not None and getattr(cfg, "use_future_pred", False))
+    pred_mask = batch.get("pred_mask", None) if use_future_pred else None
+    if pred_mask is not None:
+        pred_mask = pred_mask.to(device_id)
+
+    # VLA forward pass. The pred branch must keep gradients so pred_queries/LoRA/action hidden
+    # states can learn from action loss + DINOv3 pred loss; legacy action-head-only training stays frozen.
+    grad_context = nullcontext() if use_future_pred else torch.no_grad()
+    with grad_context, torch.autocast("cuda", dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
@@ -345,6 +377,7 @@ def run_forward_pass(
             noisy_action_projector=None,
             diffusion_timestep_embeddings=None,
             use_film=use_film,
+            pred_mask=pred_mask,
             )
 
     # Get action masks needed for logging
@@ -443,8 +476,74 @@ def run_forward_pass(
                 }
             )
 
+    # ----- Optional: future-vision prediction (PRO mode add-on) -----
+    if use_future_pred and pred_mask is not None and "future_pred_features" in batch:
+        loss = loss + _compute_future_pred_loss(
+            vla=vla,
+            output=output,
+            batch=batch,
+            pred_mask=pred_mask,
+            device_id=device_id,
+            cfg=cfg,
+            metrics=metrics,
+        )
+
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
+
+
+def _compute_future_pred_loss(
+    vla,
+    output,
+    batch,
+    pred_mask: torch.Tensor,
+    device_id,
+    cfg,
+    metrics: Dict[str, float],
+) -> torch.Tensor:
+    """Compute cosine loss between pred-token outputs and cached DINOv3 future features.
+
+    target_latent: cached facebook/dinov3-vitl16-pretrain-lvd1689m features.
+    pred_latent: last-layer hidden states at pred-token positions -> pred_head.
+    """
+    base = vla.module if hasattr(vla, "module") else vla
+    # Unwrap PEFT (LoRA): PeftModel.base_model is a LoraModel; .model is the original HF model.
+    # Plain HF models also expose `base_model` (returns self), so detect PEFT explicitly.
+    inner = base.base_model.model if base.__class__.__name__ in ("PeftModel", "PeftModelForCausalLM") else base
+
+    target = batch["future_pred_features"].to(device_id).to(torch.float32)
+    future_pad_mask = batch["future_pad_mask"].to(device_id)  # (B, chunk) bool
+    B, chunk = target.shape[0], target.shape[1]
+    if target.shape[-1] != DINO_V3_FEATURE_DIM:
+        raise ValueError(f"Expected DINOv3 feature dim {DINO_V3_FEATURE_DIM}, got {target.shape[-1]}.")
+
+    # Source: pred-token hidden states from the last layer.
+    last_hidden = output.hidden_states[-1]                            # (B, S, llm_dim)
+    # `pred_mask` is aligned with `input_ids` (length L), but `last_hidden` is the multimodal
+    # sequence: [BOS, vision_patches(+proprio?), lang_tokens...] with S = L + P (P = #patch tokens).
+    # Language token index i maps to hidden index: i==0 -> 0, i>=1 -> P + i.
+    S = last_hidden.shape[1]
+    L = pred_mask.shape[1]
+    P = S - L
+    batch_idx, lang_idx = torch.where(pred_mask)
+    mm_idx = torch.where(lang_idx == 0, torch.zeros_like(lang_idx), P + lang_idx)
+    mm_pred_mask = torch.zeros(B, S, dtype=torch.bool, device=device_id)
+    mm_pred_mask[batch_idx, mm_idx] = True
+    pred_h = last_hidden[mm_pred_mask].reshape(B, chunk, -1).to(torch.bfloat16)
+    pred = inner.pred_head(pred_h).float()                            # (B, chunk, DINO_V3_FEATURE_DIM)
+
+    # Cosine alignment, masked by future_pad_mask. This is the only pred-side loss.
+    valid = future_pad_mask.float()                                   # (B, chunk)
+    cos = F.cosine_similarity(pred, target, dim=-1)                   # (B, chunk)
+    cosine_loss = ((1.0 - cos) * valid).sum() / valid.sum().clamp_min(1.0)
+    total = cfg.future_pred_loss_weight * cosine_loss
+
+    metrics.update(
+        {
+            "pred_cosine_loss": cosine_loss.item(),
+        }
+    )
+    return total
 
 
 
@@ -564,6 +663,17 @@ def save_training_checkpoint(
 
         if cfg.use_l1_regression and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
+
+        if cfg.use_future_pred:
+            base = vla.module
+            inner = base.base_model.model if base.__class__.__name__ in ("PeftModel", "PeftModelForCausalLM") else base
+            torch.save(
+                {
+                    "pred_queries": inner.pred_queries.state_dict(),
+                    "pred_head": inner.pred_head.state_dict(),
+                },
+                checkpoint_dir / f"pred_components--{checkpoint_name_suffix}",
+            )
 
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
@@ -708,6 +818,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    if cfg.use_relative_action and cfg.relative_action_mask is None:
+        raise ValueError("use_relative_action=True requires relative_action_mask.")
+    if cfg.use_future_pred and cfg.future_pred_feature_dir is None:
+        raise ValueError(
+            "use_future_pred=True requires --future_pred_feature_dir. "
+            "Generate it with vla-scripts/precompute_dinov3_features.py first."
+        )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.config_file_path = cfg.config_file_path.rstrip("/")
@@ -728,7 +845,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", mode="offline")
+        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", mode="online")
 
     # Print detected constants
     print(
@@ -829,23 +946,47 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # vla.set_version(cfg.version)
 
+    if cfg.use_future_pred:
+        # Toggle the future-vision prediction branch on the underlying HF model BEFORE PEFT wrap so
+        # the flag survives all wrappers (PEFT/DDP only proxy attribute access via ``base_model``).
+        vla.set_use_future_pred(True)
+
     if cfg.use_lora:
-        lora_config = LoraConfig(
+        # Future-pred: keep `pred_head` as a plain Linear (no LoRA) to avoid DDP "marked ready twice"
+        # on shared paths. Newer PEFT supports `exclude_modules`; older PEFT needs an explicit
+        # `target_modules` list derived from all Linear layers minus `pred_head`.
+        lora_kw = dict(
             r=cfg.lora_rank,
-            lora_alpha= 2 * cfg.lora_rank,
+            lora_alpha=2 * cfg.lora_rank,
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
             init_lora_weights="gaussian",
         )
+        if cfg.use_future_pred and "exclude_modules" in inspect.signature(LoraConfig).parameters:
+            lora_kw["target_modules"] = "all-linear"
+            lora_kw["exclude_modules"] = ["pred_head"]
+        elif cfg.use_future_pred:
+            suffixes = _lora_target_linear_suffixes_excluding(vla, ("pred_head",))
+            if not suffixes:
+                raise RuntimeError(
+                    "Could not build LoRA target_modules after excluding pred_head (no Linear layers left?)."
+                )
+            lora_kw["target_modules"] = suffixes
+        else:
+            lora_kw["target_modules"] = "all-linear"
+        lora_config = LoraConfig(**lora_kw)
         vla = get_peft_model(vla, lora_config)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
+                param.requires_grad = True
+            if cfg.use_future_pred and ("pred_queries" in name or "pred_head" in name):
                 param.requires_grad = True
         vla.print_trainable_parameters()
 
     else:
         for name, param in vla.named_parameters():
             if "action_queries" in name:
+                param.requires_grad = True
+            if cfg.use_future_pred and ("pred_queries" in name or "pred_head" in name):
                 param.requires_grad = True
 
     # FiLM setup
@@ -867,6 +1008,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
+    if cfg.use_future_pred and hasattr(vla, "_set_static_graph"):
+        vla._set_static_graph()
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -956,7 +1099,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
-        use_minivlm=cfg.use_minivlm
+        use_minivlm=cfg.use_minivlm,
+        use_future_pred=cfg.use_future_pred,
+        future_pred_feature_dir=cfg.future_pred_feature_dir,
         )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -965,6 +1110,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        use_relative_action=cfg.use_relative_action,
+        relative_action_mask=cfg.relative_action_mask,
+        use_future_pred=cfg.use_future_pred,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -975,6 +1123,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
+            use_relative_action=cfg.use_relative_action,
+            relative_action_mask=cfg.relative_action_mask,
+            use_future_pred=cfg.use_future_pred,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1015,6 +1166,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    if cfg.use_future_pred:
+        recent_metrics.update({
+            "pred_cosine_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        })
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:

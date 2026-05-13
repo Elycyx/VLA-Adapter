@@ -16,6 +16,7 @@ from typing import Optional, Union
 
 import draccus
 import numpy as np
+import torch
 import tqdm
 from libero.libero import benchmark
 
@@ -94,6 +95,8 @@ class GenerateConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    use_relative_action: bool = False                # If True, convert predicted deltas back to absolute actions
+    relative_action_mask: Optional[str] = None        # Comma-separated bool mask, e.g. true,true,false
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
@@ -126,6 +129,8 @@ class GenerateConfig:
     # fmt: on
     save_version: str = "vla-adapter"                # version of 
     use_pro_version: bool = True                     # encourage to use the pro models we released.
+    use_future_pred: bool = False                    # If True, loads pred_components and enables the
+                                                     # future-vision prediction branch at inference.
     phase: str = "Inference"
 
 
@@ -138,6 +143,8 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    if cfg.use_relative_action and cfg.relative_action_mask is None:
+        raise ValueError("use_relative_action=True requires relative_action_mask.")
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -157,6 +164,18 @@ def initialize_model(cfg: GenerateConfig):
             model.llm_dim,
             proprio_dim=8,  # 8-dimensional proprio for LIBERO
         )
+
+    # Optional future-vision prediction branch
+    if cfg.use_future_pred:
+        from experiments.robot.openvla_utils import find_checkpoint_file
+
+        ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "pred_components")
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        model.pred_queries.load_state_dict(state["pred_queries"])
+        model.pred_head.load_state_dict(state["pred_head"])
+        model.pred_queries.to(model.device, dtype=torch.bfloat16)
+        model.pred_head.to(model.device, dtype=torch.bfloat16)
+        model.set_use_future_pred(True)
 
     # Load action head if needed
     action_head = None

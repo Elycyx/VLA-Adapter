@@ -154,3 +154,8 @@ wandb/
 outputs/
 
 pretrained_models/prism-qwen25-extra-dinosiglip-224px-0_5b
+
+dinov3-vitl16-pretrain-lvd1689m/
+
+pretrained_models/configs/config.json.back*
+pretrained_models/configs/modeling_prismatic.py.back*

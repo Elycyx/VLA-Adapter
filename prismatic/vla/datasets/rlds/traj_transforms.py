@@ -6,12 +6,17 @@ that represents a single trajectory, meaning each tensor has the same leading di
 """
 
 import logging
-from typing import Dict
+from typing import Dict, Optional, Sequence
 
 import tensorflow as tf
 
 
-def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
+def chunk_act_obs(
+    traj: Dict,
+    window_size: int,
+    future_action_window_size: int = 0,
+    future_obs_window_size: int = 0,
+) -> Dict:
     """
     Chunks actions and observations into the given window_size.
 
@@ -30,7 +35,6 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     backed by real data versus filled by clamping.
     """
     traj_len = tf.shape(traj["action"])[0]
-    action_dim = traj["action"].shape[-1]
     effective_traj_len = traj_len
     chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
@@ -60,11 +64,57 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     # True for action positions backed by real data; False where the index was clamped to the last frame.
     traj["pad_mask_future_actions"] = action_chunk_indices <= goal_timestep[:, None]
 
+    # Optionally chunk **future** observations for the predictive-token branch (future-vision target).
+    # Indices for step t are [t+1, ..., t+future_obs_window_size]. Out-of-range indices are clamped to
+    # the last frame; `pad_mask_future_obs` records which positions are real vs clamped.
+    # NOTE: We store these at the top level (sibling to "observation") so the frame-level `dl.vmap`
+    # pipeline that decodes/augments observation images does not see them (mixing leading dims would
+    # break vmap). A dedicated frame transform decodes/resizes them later.
+    if future_obs_window_size > 0 and "image_primary" in traj["observation"]:
+        future_obs_indices = tf.broadcast_to(
+            tf.range(1, 1 + future_obs_window_size),
+            [effective_traj_len, future_obs_window_size],
+        ) + tf.broadcast_to(
+            tf.range(effective_traj_len)[:, None],
+            [effective_traj_len, future_obs_window_size],
+        )
+        floored_future_obs_indices = tf.minimum(tf.maximum(future_obs_indices, 0), goal_timestep[:, None])
+        # Only gather the primary image (wrist views are not used as prediction targets).
+        traj["image_primary_future"] = tf.gather(
+            traj["observation"]["image_primary"], floored_future_obs_indices
+        )
+        traj["pad_mask_future_obs"] = future_obs_indices <= goal_timestep[:, None]
+
     # Truncate other elements of the trajectory dict
     traj["task"] = tf.nest.map_structure(lambda x: tf.gather(x, tf.range(effective_traj_len)), traj["task"])
     traj["dataset_name"] = tf.gather(traj["dataset_name"], tf.range(effective_traj_len))
     traj["absolute_action_mask"] = tf.gather(traj["absolute_action_mask"], tf.range(effective_traj_len))
 
+    return traj
+
+
+def make_actions_relative_to_current_state(traj: Dict, relative_action_mask: Optional[Sequence[bool]]) -> Dict:
+    """Convert action chunks to OpenPI-style deltas relative to the current state's proprio."""
+    if relative_action_mask is None:
+        return traj
+
+    if "proprio" not in traj["observation"]:
+        raise ValueError("Relative actions require observation['proprio'].")
+
+    mask = tf.convert_to_tensor(relative_action_mask, dtype=tf.bool)
+    dims = len(relative_action_mask)
+    action_dim = traj["action"].shape[-1]
+    proprio_dim = traj["observation"]["proprio"].shape[-1]
+    if action_dim is not None and dims > action_dim:
+        raise ValueError(f"Length of relative_action_mask ({dims}) exceeds action dimension ({action_dim}).")
+    if proprio_dim is not None and dims > proprio_dim:
+        raise ValueError(f"Length of relative_action_mask ({dims}) exceeds proprio dimension ({proprio_dim}).")
+
+    # observation["proprio"] has shape [T, window_size, D] after chunking; the last window entry is current state.
+    current_state = traj["observation"]["proprio"][:, -1, :dims]
+    action_prefix = traj["action"][..., :dims]
+    relative_prefix = tf.where(mask, action_prefix - current_state[:, None, :], action_prefix)
+    traj["action"] = tf.concat([relative_prefix, traj["action"][..., dims:]], axis=-1)
     return traj
 
 

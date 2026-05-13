@@ -8,7 +8,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 import numpy as np
 import random
 import torch
@@ -20,7 +20,8 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder, QwenPromptBu
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
 from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX, NUM_TOKENS
+from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, DINO_V3_FEATURE_DIM, IGNORE_INDEX, NUM_ACTIONS_CHUNK, NUM_PRED_TOKENS, PROPRIO_DIM, STOP_INDEX, NUM_TOKENS
+from prismatic.vla.datasets.dinov3_features import load_feature
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 
@@ -36,6 +37,8 @@ class RLDSBatchTransform:
     use_wrist_image: bool = False
     use_proprio: bool = False
     use_minivlm: bool = False
+    use_future_pred: bool = False
+    future_pred_feature_dir: Optional[Path] = None
 
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,12 +82,24 @@ class RLDSBatchTransform:
                 del input_ids[-1] 
 
             if NUM_TOKENS<len(flattened_action_chunk_string):
-                input_ids = input_ids + flattened_action_chunk_string[:NUM_TOKENS]
+                action_token_ids = flattened_action_chunk_string[:NUM_TOKENS]
             else:
                 remaining_length = NUM_TOKENS - len(flattened_action_chunk_string)
                 extended_array = random.choices(flattened_action_chunk_string, k=remaining_length)
-                
-                input_ids = input_ids + flattened_action_chunk_string + extended_array
+                action_token_ids = flattened_action_chunk_string + extended_array
+
+            # Optionally append NUM_PRED_TOKENS predictive-token placeholders AFTER the action token
+            # placeholders. We use STOP_INDEX (not the tokenizer's pad id!) because the collator
+            # builds `attention_mask = input_ids.ne(pad_token_id)` and we MUST keep pred positions
+            # attended. STOP_INDEX is also far below ACTION_TOKEN_BEGIN_IDX, so the action-mask
+            # heuristic (`labels >= ACTION_TOKEN_BEGIN_IDX`) will not pick them up.
+            prompt_len = len(input_ids)
+            if self.use_future_pred:
+                pred_placeholders = [STOP_INDEX] * NUM_PRED_TOKENS
+                input_ids = input_ids + action_token_ids + pred_placeholders
+            else:
+                input_ids = input_ids + action_token_ids
+
             labels = list(input_ids)
             action_chunk_len = NUM_TOKENS
 
@@ -127,6 +142,44 @@ class RLDSBatchTransform:
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
+        # Future-vision prediction extras
+        if self.use_future_pred:
+            if self.future_pred_feature_dir is None:
+                raise ValueError(
+                    "use_future_pred=True requires future_pred_feature_dir. "
+                    "Run vla-scripts/precompute_dinov3_features.py and pass its output directory."
+                )
+            # With pred tokens after the action placeholders, explicitly mark only the action span
+            # as supervised and keep all pred positions ignored.
+            labels[:] = IGNORE_INDEX
+            labels[prompt_len : prompt_len + action_chunk_len] = input_ids[
+                prompt_len : prompt_len + action_chunk_len
+            ]
+            # Pred placeholders sit after the action tokens in `input_ids`.
+            pred_start = prompt_len + action_chunk_len
+            seq_len = input_ids.shape[0]
+            pred_mask = torch.zeros(seq_len, dtype=torch.bool)
+            pred_mask[pred_start : pred_start + NUM_PRED_TOKENS] = True
+            # Force pred-position labels to IGNORE_INDEX (in case the trailing slice above missed any).
+            labels[pred_start : pred_start + NUM_PRED_TOKENS] = IGNORE_INDEX
+
+            future_imgs = rlds_batch["image_primary_future"]  # (chunk, H, W, 3) uint8
+            future_pad_mask = torch.from_numpy(
+                np.asarray(rlds_batch["pad_mask_future_obs"], dtype=np.bool_).copy()
+            )
+            future_features = np.stack(
+                [load_feature(self.future_pred_feature_dir, future_imgs[i]) for i in range(future_imgs.shape[0])],
+                axis=0,
+            )
+            if future_features.shape[-1] != DINO_V3_FEATURE_DIM:
+                raise ValueError(
+                    f"Expected cached DINOv3 features with dim {DINO_V3_FEATURE_DIM}, "
+                    f"got {future_features.shape[-1]} from {self.future_pred_feature_dir}."
+                )
+            return_dict["pred_mask"] = pred_mask
+            return_dict["future_pred_features"] = torch.from_numpy(future_features).to(torch.float32)
+            return_dict["future_pad_mask"] = future_pad_mask
+
         # Add additional inputs
         if self.use_wrist_image:
             all_wrist_pixels = []
@@ -154,6 +207,9 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        use_relative_action: bool = False,
+        relative_action_mask: Optional[Tuple[bool, ...]] = None,
+        use_future_pred: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -180,12 +236,19 @@ class RLDSDataset(IterableDataset):
             load_language=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
+        for dataset_kwargs in per_dataset_kwargs:
+            dataset_kwargs["use_relative_action"] = use_relative_action
+            dataset_kwargs["relative_action_mask"] = relative_action_mask
+
         rlds_config = dict(
             traj_transform_kwargs=dict(
                 window_size=1,                                      # If we wanted to feed / predict more than one step
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
+                future_obs_window_size=NUM_ACTIONS_CHUNK if use_future_pred else 0,
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
+                use_relative_action=use_relative_action,
+                relative_action_mask=relative_action_mask,
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
