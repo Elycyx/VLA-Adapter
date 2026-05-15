@@ -135,6 +135,7 @@ class FinetuneConfig:
     # Future-vision prediction (optional, requires `use_pro_version=True`)
     use_future_pred: bool = False                    # If True, adds NUM_PRED_TOKENS predictive tokens
                                                      # supervised against cached DINOv3 future-obs features.
+    pred_tokens_before_action: bool = False          # If True, sequence is prompt -> pred -> action.
     future_pred_feature_dir: Optional[Path] = None   # Directory produced by precompute_dinov3_features.py.
     future_pred_loss_weight: float = 1.0             # Weight for the DINOv3 cosine alignment term.
     # fmt: on
@@ -671,6 +672,7 @@ def save_training_checkpoint(
                 {
                     "pred_queries": inner.pred_queries.state_dict(),
                     "pred_head": inner.pred_head.state_dict(),
+                    "pred_tokens_before_action": cfg.pred_tokens_before_action,
                 },
                 checkpoint_dir / f"pred_components--{checkpoint_name_suffix}",
             )
@@ -950,6 +952,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         # Toggle the future-vision prediction branch on the underlying HF model BEFORE PEFT wrap so
         # the flag survives all wrappers (PEFT/DDP only proxy attribute access via ``base_model``).
         vla.set_use_future_pred(True)
+        vla.set_pred_tokens_before_action(cfg.pred_tokens_before_action)
 
     if cfg.use_lora:
         # Future-pred: keep `pred_head` as a plain Linear (no LoRA) to avoid DDP "marked ready twice"
@@ -1101,6 +1104,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_proprio=cfg.use_proprio,
         use_minivlm=cfg.use_minivlm,
         use_future_pred=cfg.use_future_pred,
+        pred_tokens_before_action=cfg.pred_tokens_before_action,
         future_pred_feature_dir=cfg.future_pred_feature_dir,
         )
     train_dataset = RLDSDataset(

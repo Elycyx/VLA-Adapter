@@ -131,6 +131,7 @@ class GenerateConfig:
     use_pro_version: bool = True                     # encourage to use the pro models we released.
     use_future_pred: bool = False                    # If True, loads pred_components and enables the
                                                      # future-vision prediction branch at inference.
+    pred_tokens_before_action: bool = False          # If True, pred tokens are inserted before action tokens.
     phase: str = "Inference"
 
 
@@ -176,6 +177,7 @@ def initialize_model(cfg: GenerateConfig):
         model.pred_queries.to(model.device, dtype=torch.bfloat16)
         model.pred_head.to(model.device, dtype=torch.bfloat16)
         model.set_use_future_pred(True)
+        model.set_pred_tokens_before_action(bool(state.get("pred_tokens_before_action", cfg.pred_tokens_before_action)))
 
     # Load action head if needed
     action_head = None

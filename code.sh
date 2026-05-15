@@ -16,7 +16,7 @@ CUDA_VISIBLE_DEVICES=2 python vla-scripts/precompute_dinov3_features.py \
 --model_id ./dinov3-vitl16-pretrain-lvd1689m \
 --batch_size 64
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-node 6 vla-scripts/finetune.py \
 --vlm_path pretrained_models/prism-qwen25-extra-dinosiglip-224px-0_5b \
 --config_file_path pretrained_models/configs \
 --data_root_dir /mnt/lx/cyx/lerobot/dataset \
@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-node 4
 --use_minivlm True \
 --image_aug True \
 --num_steps_before_decay 100000 \
---max_steps 80005 \
+--max_steps 60005 \
 --save_freq 10000 \
 --save_latest_checkpoint_only False \
 --merge_lora_during_training True \
@@ -39,17 +39,18 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-node 4
 --learning_rate 2e-4 \
 --lora_rank 64 \
 --use_pro_version True \
---use_future_pred False \
+--use_future_pred True \
+--pred_tokens_before_action True \
 --future_pred_feature_dir $dinov3_feature_dir \
 --future_pred_loss_weight 0.05 \
---run_id_note VLA-Adapter--pick_place_conveyor--bs8--$current_time \
+--run_id_note VLA-Adapter--pick_place_conveyor--pred3--$current_time \
 --use_relative_action false \
 --relative_action_mask true,true,true,true,true,true,true,false
 
 
 
 python policy_server.py \
-  --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor----90000_chkpt \
+  --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--bs8----80000_chkpt \
   --host 0.0.0.0 \
   --port 8000
 
@@ -66,4 +67,4 @@ python policy_server.py \
   --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred2----60000_chkpt \
   --use_future_pred \
   --host 0.0.0.0 \
-  --port 8000
+  --port 7000

@@ -38,6 +38,7 @@ class RLDSBatchTransform:
     use_proprio: bool = False
     use_minivlm: bool = False
     use_future_pred: bool = False
+    pred_tokens_before_action: bool = False
     future_pred_feature_dir: Optional[Path] = None
 
 
@@ -88,17 +89,23 @@ class RLDSBatchTransform:
                 extended_array = random.choices(flattened_action_chunk_string, k=remaining_length)
                 action_token_ids = flattened_action_chunk_string + extended_array
 
-            # Optionally append NUM_PRED_TOKENS predictive-token placeholders AFTER the action token
-            # placeholders. We use STOP_INDEX (not the tokenizer's pad id!) because the collator
-            # builds `attention_mask = input_ids.ne(pad_token_id)` and we MUST keep pred positions
-            # attended. STOP_INDEX is also far below ACTION_TOKEN_BEGIN_IDX, so the action-mask
-            # heuristic (`labels >= ACTION_TOKEN_BEGIN_IDX`) will not pick them up.
+            # Optionally add NUM_PRED_TOKENS predictive-token placeholders. We use STOP_INDEX
+            # (not pad) because the collator builds `attention_mask = input_ids.ne(pad_token_id)`
+            # and pred positions must be attended.
             prompt_len = len(input_ids)
             if self.use_future_pred:
                 pred_placeholders = [STOP_INDEX] * NUM_PRED_TOKENS
-                input_ids = input_ids + action_token_ids + pred_placeholders
+                if self.pred_tokens_before_action:
+                    input_ids = input_ids + pred_placeholders + action_token_ids
+                    pred_start = prompt_len
+                    action_start = prompt_len + NUM_PRED_TOKENS
+                else:
+                    input_ids = input_ids + action_token_ids + pred_placeholders
+                    action_start = prompt_len
+                    pred_start = prompt_len + NUM_TOKENS
             else:
                 input_ids = input_ids + action_token_ids
+                action_start = prompt_len
 
             labels = list(input_ids)
             action_chunk_len = NUM_TOKENS
@@ -128,6 +135,17 @@ class RLDSBatchTransform:
             prompt = prompt_builder.get_prompt() #e.g. 'In: What action should the robot take to put both the cream cheese box and the butter in the basket?\nOut: 希</s>'
             # Tokenize (w/ `base_tokenizer`)
             input_ids = self.base_tokenizer(prompt, add_special_tokens=True).input_ids
+            prompt_len = max(0, len(input_ids) - action_chunk_len)
+            action_start = prompt_len
+            if self.use_future_pred:
+                pred_placeholders = [STOP_INDEX] * NUM_PRED_TOKENS
+                if self.pred_tokens_before_action:
+                    input_ids = input_ids[:prompt_len] + pred_placeholders + input_ids[prompt_len:]
+                    pred_start = prompt_len
+                    action_start = prompt_len + NUM_PRED_TOKENS
+                else:
+                    input_ids = input_ids + pred_placeholders
+                    pred_start = len(input_ids) - NUM_PRED_TOKENS
             labels = list(input_ids)
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
@@ -149,14 +167,11 @@ class RLDSBatchTransform:
                     "use_future_pred=True requires future_pred_feature_dir. "
                     "Run vla-scripts/precompute_dinov3_features.py and pass its output directory."
                 )
-            # With pred tokens after the action placeholders, explicitly mark only the action span
-            # as supervised and keep all pred positions ignored.
+            # Explicitly mark only the action span as supervised and keep all pred positions ignored.
             labels[:] = IGNORE_INDEX
-            labels[prompt_len : prompt_len + action_chunk_len] = input_ids[
-                prompt_len : prompt_len + action_chunk_len
+            labels[action_start : action_start + action_chunk_len] = input_ids[
+                action_start : action_start + action_chunk_len
             ]
-            # Pred placeholders sit after the action tokens in `input_ids`.
-            pred_start = prompt_len + action_chunk_len
             seq_len = input_ids.shape[0]
             pred_mask = torch.zeros(seq_len, dtype=torch.bool)
             pred_mask[pred_start : pred_start + NUM_PRED_TOKENS] = True

@@ -383,6 +383,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # Initialized as zeros / identity-like; the `use_future_pred` flag is False by default so
         # these modules contribute nothing unless explicitly enabled at training time.
         self.use_future_pred: bool = False
+        self.pred_tokens_before_action: bool = False
         self.pred_queries = nn.Embedding(NUM_PRED_TOKENS, self.llm_dim)
         self.pred_queries.weight.data.zero_()
         self.pred_head = nn.Linear(self.llm_dim, DINO_V3_FEATURE_DIM, bias=False)
@@ -393,6 +394,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def set_use_future_pred(self, flag: bool) -> None:
         """Toggle the future-vision prediction branch (affects forward + predict_action)."""
         self.use_future_pred = bool(flag)
+
+    def set_pred_tokens_before_action(self, flag: bool) -> None:
+        """Choose whether pred-token slots are inserted before or after action-query slots."""
+        self.pred_tokens_before_action = bool(flag)
 
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
@@ -777,8 +782,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask, pad_token_id: Optional[int] = None):
         """Prepares input for action prediction by adding necessary tokens.
 
-        When `self.use_future_pred=True`, also reserves NUM_PRED_TOKENS predictive-token slots
-        AFTER the action placeholders. Returns an additional `pred_mask` tensor (or None).
+        When `self.use_future_pred=True`, also reserves NUM_PRED_TOKENS predictive-token slots.
+        Their position is controlled by `self.pred_tokens_before_action`. Returns an additional
+        `pred_mask` tensor (or None).
         """
         del pad_token_id  # unused; pred placeholders use STOP_INDEX (must be attended, not pad).
         bsz = input_ids.shape[0]
@@ -786,14 +792,21 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         device, dtype = input_ids.device, input_ids.dtype
 
         placeholder_action_token_ids = torch.ones((bsz, NUM_TOKENS), device=device, dtype=dtype)
-        input_ids = torch.cat([input_ids, placeholder_action_token_ids], dim=-1)
+        pred_start = None
 
         if self.use_future_pred:
             # Predictive-token placeholders use STOP_INDEX rather than pad_token_id so they are NOT
             # zeroed-out in the attention mask. Their embeddings get replaced by `pred_queries` in
             # forward(); the actual id contents are irrelevant for downstream behavior.
             pred_placeholders = torch.full((bsz, NUM_PRED_TOKENS), STOP_INDEX, device=device, dtype=dtype)
-            input_ids = torch.cat([input_ids, pred_placeholders], dim=-1)
+            if self.pred_tokens_before_action:
+                pred_start = prompt_len
+                input_ids = torch.cat([input_ids, pred_placeholders, placeholder_action_token_ids], dim=-1)
+            else:
+                pred_start = prompt_len + NUM_TOKENS
+                input_ids = torch.cat([input_ids, placeholder_action_token_ids, pred_placeholders], dim=-1)
+        else:
+            input_ids = torch.cat([input_ids, placeholder_action_token_ids], dim=-1)
 
         # Add stop token to sequence (needed in non-causal bi-directional self-attention, as it appears at train time)
         stop_token_id = torch.ones((bsz, 1), device=device, dtype=dtype) * STOP_INDEX
@@ -808,12 +821,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
         attention_mask = torch.cat([attention_mask, mask_extension], dim=-1)
 
-        # Build pred_mask spanning the slots immediately after the action placeholders within `input_ids`
+        # Build pred_mask spanning the predictive slots within `input_ids`
         # (no vision patches are inserted yet; consumers must offset accordingly when used post-vision).
         pred_mask = None
         if self.use_future_pred:
             pred_mask = torch.zeros((bsz, input_ids.shape[-1]), dtype=torch.bool, device=device)
-            pred_start = prompt_len + NUM_TOKENS
             pred_mask[:, pred_start : pred_start + NUM_PRED_TOKENS] = True
 
         return input_ids, attention_mask, pred_mask
@@ -902,9 +914,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             return_dict=True,
         )
 
-        # Extract hidden states for action tokens. Future-pred tokens are appended AFTER the action
-        # placeholders, so the action-token offset stays unchanged.
-        action_offset = 0
+        # Extract hidden states for action tokens. If pred tokens are before action tokens, action slots
+        # are shifted by NUM_PRED_TOKENS within the language segment.
+        action_offset = NUM_PRED_TOKENS if (self.use_future_pred and self.pred_tokens_before_action) else 0
         multi_layer_hidden_states = []
 
         for item in language_model_output.hidden_states[0:]:

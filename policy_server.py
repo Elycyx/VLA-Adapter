@@ -66,6 +66,7 @@ class ServerConfig:
     use_minivlm: bool = True
     use_pro_version: bool = True
     use_future_pred: bool = False
+    pred_tokens_before_action: bool = False
     use_relative_action: bool = False
     relative_action_mask: str | tuple[bool, ...] | list[bool] | None = None
     center_crop: bool = False
@@ -154,6 +155,9 @@ class VLAAdapterPolicy:
             self.model.pred_queries.to(self.device, dtype=torch.bfloat16)
             self.model.pred_head.to(self.device, dtype=torch.bfloat16)
             self.model.set_use_future_pred(True)
+            pred_before_action = bool(state.get("pred_tokens_before_action", cfg.pred_tokens_before_action))
+            self.cfg.pred_tokens_before_action = pred_before_action
+            self.model.set_pred_tokens_before_action(pred_before_action)
             _status("future-pred branch enabled")
 
         self.action_head = None
@@ -204,6 +208,7 @@ class VLAAdapterPolicy:
             "use_relative_action": self.cfg.use_relative_action,
             "relative_action_mask": self.cfg.relative_action_mask,
             "use_future_pred": self.cfg.use_future_pred,
+            "pred_tokens_before_action": self.cfg.pred_tokens_before_action,
         }
 
     def predict_one(self, request: dict[str, Any], env_idx: int) -> np.ndarray:
@@ -603,6 +608,11 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--use_minivlm", action=argparse.BooleanOptionalAction, default=CONFIG.use_minivlm)
     parser.add_argument("--use_pro_version", action=argparse.BooleanOptionalAction, default=CONFIG.use_pro_version)
     parser.add_argument("--use_future_pred", action=argparse.BooleanOptionalAction, default=CONFIG.use_future_pred)
+    parser.add_argument(
+        "--pred_tokens_before_action",
+        action=argparse.BooleanOptionalAction,
+        default=CONFIG.pred_tokens_before_action,
+    )
     parser.add_argument("--use_relative_action", action=argparse.BooleanOptionalAction, default=CONFIG.use_relative_action)
     parser.add_argument(
         "--relative_action_mask",
