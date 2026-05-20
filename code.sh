@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-no
 --use_minivlm True \
 --image_aug True \
 --num_steps_before_decay 100000 \
---max_steps 60005 \
+--max_steps 80005 \
 --save_freq 10000 \
 --save_latest_checkpoint_only False \
 --merge_lora_during_training True \
@@ -40,10 +40,13 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-no
 --lora_rank 64 \
 --use_pro_version True \
 --use_future_pred True \
---pred_tokens_before_action True \
+--use_future_conf False \
+--future_confidence_gamma 1.0 \
+--future_conf_loss_weight 0.1 \
+--pred_tokens_before_action False \
 --future_pred_feature_dir $dinov3_feature_dir \
 --future_pred_loss_weight 0.05 \
---run_id_note VLA-Adapter--pick_place_conveyor--pred3--$current_time \
+--run_id_note VLA-Adapter--pick_place_conveyor--pred--conf--$current_time \
 --use_relative_action false \
 --relative_action_mask true,true,true,true,true,true,true,false
 
@@ -66,5 +69,39 @@ python policy_server.py \
 python policy_server.py \
   --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred2----60000_chkpt \
   --use_future_pred \
+  --use_future_conf \
   --host 0.0.0.0 \
-  --port 7000
+  --port 8000
+
+
+python policy_server.py \
+  --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred2----60000_chkpt \
+  --use_future_pred \
+  --use_future_conf \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --return_confidence \
+  --confidence_threshold 0.02 \
+  --min_action_horizon 2 --confidence-score-log ./logs/confidence_scores.jsonl
+
+
+
+python policy_server.py \
+  --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred--conf----80000_chkpt \
+  --use_future_pred \
+  --use_future_conf \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --return_confidence \
+  --confidence_threshold 0.8 \
+  --min_action_horizon 1 --confidence-score-log ./logs/confidence_scores.jsonl
+
+
+
+torchrun --standalone --nproc_per_node=4 vla-scripts/train_recon_probe.py \
+  --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred2----60000_chkpt \
+  --data_root_dir /mnt/lx/cyx/lerobot/dataset \
+  --batch_size 8 \
+  --max_steps 80005 \
+  --save_freq 10000 \
+  --dataset_name pick_place_conveyor

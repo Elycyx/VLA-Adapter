@@ -384,9 +384,18 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # these modules contribute nothing unless explicitly enabled at training time.
         self.use_future_pred: bool = False
         self.pred_tokens_before_action: bool = False
+        self.use_future_conf: bool = False
+        self.future_confidence_gamma: float = 1.0
         self.pred_queries = nn.Embedding(NUM_PRED_TOKENS, self.llm_dim)
         self.pred_queries.weight.data.zero_()
         self.pred_head = nn.Linear(self.llm_dim, DINO_V3_FEATURE_DIM, bias=False)
+        confidence_hidden_dim = max(128, self.llm_dim // 4)
+        self.pred_confidence_head = nn.Sequential(
+            nn.Linear(self.llm_dim, confidence_hidden_dim),
+            nn.GELU(),
+            nn.Linear(confidence_hidden_dim, 1),
+            nn.Sigmoid(),
+        )
 
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
@@ -398,6 +407,11 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def set_pred_tokens_before_action(self, flag: bool) -> None:
         """Choose whether pred-token slots are inserted before or after action-query slots."""
         self.pred_tokens_before_action = bool(flag)
+
+    def set_use_future_conf(self, flag: bool, gamma: float = 1.0) -> None:
+        """Toggle the learned future-confidence head used for dynamic chunking."""
+        self.use_future_conf = bool(flag)
+        self.future_confidence_gamma = float(gamma)
 
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
@@ -866,6 +880,90 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         return actions
 
+    def _compute_pred_attention_confidence(
+        self,
+        language_model_output,
+        normalized_actions,
+        NUM_PATCHES: int,
+        NUM_PROMPT_TOKENS: int,
+        cumulative_min: bool = True,
+    ) -> Dict[str, np.ndarray]:
+        """Training-free confidence from pred-token attention to action-token slots."""
+        batch_size = normalized_actions.shape[0]
+        if not (self.use_future_pred and language_model_output.attentions is not None):
+            confidence = np.ones((batch_size, NUM_ACTIONS_CHUNK), dtype=np.float32)
+            return {
+                "pred_confidence": confidence,
+                "raw_pred_confidence": confidence.copy(),
+                "pred_to_action_attention": confidence.copy(),
+                "action_attention_mass": confidence.copy(),
+            }
+
+        action_offset = NUM_PRED_TOKENS if self.pred_tokens_before_action else 0
+        action_start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
+        if self.pred_tokens_before_action:
+            pred_start = NUM_PATCHES + NUM_PROMPT_TOKENS
+        else:
+            pred_start = action_start + NUM_TOKENS
+
+        # Last-layer attention: (B, heads, S, S). Average heads, then measure how much
+        # each pred query attends to action tokens for the corresponding future step.
+        attn = language_model_output.attentions[-1].float().mean(dim=1)
+        pred_to_actions = attn[
+            :,
+            pred_start : pred_start + NUM_PRED_TOKENS,
+            action_start : action_start + NUM_TOKENS,
+        ]
+        by_action_step = pred_to_actions.reshape(
+            batch_size, NUM_PRED_TOKENS, NUM_ACTIONS_CHUNK, ACTION_DIM
+        ).sum(dim=-1)
+        same_step = by_action_step.diagonal(dim1=1, dim2=2)
+        action_mass = by_action_step.sum(dim=-1).clamp_min(1e-8)
+        raw_confidence = (same_step / action_mass).clamp(0.0, 1.0)
+        confidence = raw_confidence
+        if cumulative_min:
+            confidence = torch.cummin(confidence, dim=1).values
+
+        return {
+            "pred_confidence": confidence.detach().cpu().numpy().astype(np.float32),
+            "raw_pred_confidence": raw_confidence.detach().cpu().numpy().astype(np.float32),
+            "pred_to_action_attention": raw_confidence.detach().cpu().numpy().astype(np.float32),
+            "action_attention_mass": action_mass.detach().cpu().numpy().astype(np.float32),
+        }
+
+    def _compute_pred_learned_confidence(
+        self,
+        language_model_output,
+        normalized_actions,
+        NUM_PATCHES: int,
+        NUM_PROMPT_TOKENS: int,
+        cumulative_min: bool = True,
+    ) -> Dict[str, np.ndarray]:
+        """Learned rollout reliability confidence from pred-token hidden states."""
+        batch_size = normalized_actions.shape[0]
+        if not (self.use_future_pred and self.use_future_conf):
+            confidence = np.ones((batch_size, NUM_ACTIONS_CHUNK), dtype=np.float32)
+            return {
+                "pred_confidence": confidence,
+                "raw_pred_confidence": confidence.copy(),
+            }
+
+        action_offset = NUM_PRED_TOKENS if self.pred_tokens_before_action else 0
+        action_start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
+        pred_start = NUM_PATCHES + NUM_PROMPT_TOKENS if self.pred_tokens_before_action else action_start + NUM_TOKENS
+
+        last_hidden = language_model_output.hidden_states[-1]
+        pred_h = last_hidden[:, pred_start : pred_start + NUM_PRED_TOKENS, :].to(torch.bfloat16)
+        raw_confidence = self.pred_confidence_head(pred_h).squeeze(-1).float()
+        confidence = raw_confidence
+        if cumulative_min:
+            confidence = torch.cummin(confidence, dim=1).values
+
+        return {
+            "pred_confidence": confidence.detach().cpu().numpy().astype(np.float32),
+            "raw_pred_confidence": raw_confidence.detach().cpu().numpy().astype(np.float32),
+        }
+
 
     def _regression_or_discrete_prediction(
         self,
@@ -880,6 +978,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         proprio=None,
         proprio_projector=None,
         pred_mask=None,
+        return_pred_confidence: bool = False,
+        pred_confidence_cumulative_min: bool = True,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
 
@@ -909,7 +1009,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             inputs_embeds=multimodal_embeddings,
             labels=None,
             use_cache=None,
-            output_attentions=False,
+            output_attentions=return_pred_confidence and not self.use_future_conf,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -959,7 +1059,26 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = self.bin_centers[discretized_actions]
             normalized_actions = normalized_actions.reshape(input_embeddings.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM)
 
-        return normalized_actions, actions_hidden_states
+        pred_info = {}
+        if return_pred_confidence:
+            if self.use_future_conf:
+                pred_info = self._compute_pred_learned_confidence(
+                    language_model_output=language_model_output,
+                    normalized_actions=normalized_actions,
+                    NUM_PATCHES=NUM_PATCHES,
+                    NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+                    cumulative_min=pred_confidence_cumulative_min,
+                )
+            else:
+                pred_info = self._compute_pred_attention_confidence(
+                    language_model_output=language_model_output,
+                    normalized_actions=normalized_actions,
+                    NUM_PATCHES=NUM_PATCHES,
+                    NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+                    cumulative_min=pred_confidence_cumulative_min,
+                )
+
+        return normalized_actions, actions_hidden_states, pred_info
 
 
     def predict_action(
@@ -998,6 +1117,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Get number of tokens in prompt (excluding the start token)
         NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
+        return_pred_confidence = bool(kwargs.pop("return_pred_confidence", False))
 
         # Prepare inputs by adding necessary tokens
         input_ids, attention_mask, pred_mask = self._prepare_input_for_action_prediction(
@@ -1035,7 +1155,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
 
         # Run regression or discrete token-based prediction
-        normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
+        normalized_actions, actions_hidden_states, pred_info = self._regression_or_discrete_prediction(
             input_embeddings,
             all_actions_mask,
             projected_patch_embeddings,
@@ -1047,11 +1167,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             proprio=proprio, # [8]
             proprio_projector=proprio_projector,
             pred_mask=pred_mask,
+            return_pred_confidence=return_pred_confidence,
+            pred_confidence_cumulative_min=kwargs.pop("pred_confidence_cumulative_min", True),
             )
            
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
+        if return_pred_confidence:
+            return actions, actions_hidden_states, pred_info
         return actions, actions_hidden_states
 
 

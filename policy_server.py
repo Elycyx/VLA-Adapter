@@ -9,6 +9,10 @@ The API matches POLICY_SERVER.md and is consumed by policy_client.py:
 Debug:
     --debug 会在每次 POST /predict 打印完整请求与完整响应 JSON（同时 stdout + logger）。
     为避免日志爆炸，默认不会打印 images 里的 base64 正文，只会打印长度与短 hash。
+
+Confidence:
+    --return_confidence 与 --confidence-score-log PATH 同时开启时，每次推理将各步得分以 JSON 一行
+    追加写入 PATH，并在 logger INFO 打同样一条紧凑 JSON。
 """
 
 from __future__ import annotations
@@ -67,6 +71,8 @@ class ServerConfig:
     use_pro_version: bool = True
     use_future_pred: bool = False
     pred_tokens_before_action: bool = False
+    use_future_conf: bool = False
+    future_confidence_gamma: float = 1.0
     use_relative_action: bool = False
     relative_action_mask: str | tuple[bool, ...] | list[bool] | None = None
     center_crop: bool = False
@@ -75,6 +81,12 @@ class ServerConfig:
     compile: bool = False
     debug: bool = False
     save_model_images: str | None = None
+    return_confidence: bool = False
+    confidence_threshold: float = 0.65
+    min_action_horizon: int = 2
+    confidence_cumulative_min: bool = True
+    # When set alongside return_confidence: append each inference's per-step scores (JSONL) and log a summary.
+    confidence_score_log: str | None = None
 
     @property
     def num_open_loop_steps(self) -> int:
@@ -83,11 +95,63 @@ class ServerConfig:
 
 _SAVE_MODEL_IMAGES_SEQ = 0
 _SAVE_MODEL_IMAGES_LOCK = threading.Lock()
+_CONFIDENCE_SCORE_LOG_LOCK = threading.Lock()
+
+
+def _append_confidence_score_log(path: Path, record: dict[str, Any]) -> None:
+    """Append one JSON object per line (thread-safe)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+    with _CONFIDENCE_SCORE_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def _confidence_log_record(
+    *,
+    request: dict[str, Any],
+    num_envs: int,
+    latency_s: float,
+    confidence_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a serializable record for file + logger (per-step scores per env)."""
+    per_env: list[dict[str, Any]] = []
+    action_conf = confidence_payload.get("action_confidence")
+    eff = confidence_payload.get("effective_horizon")
+    details = {
+        k: confidence_payload[k]
+        for k in (
+            "raw_pred_confidence",
+            "pred_to_action_attention",
+            "action_attention_mass",
+        )
+        if k in confidence_payload
+    }
+    for i in range(num_envs):
+        entry: dict[str, Any] = {"env_idx": i}
+        if isinstance(action_conf, list) and i < len(action_conf):
+            entry["action_confidence"] = action_conf[i]
+        if isinstance(eff, list) and i < len(eff):
+            entry["effective_horizon"] = eff[i]
+        for k, v in details.items():
+            if isinstance(v, list) and i < len(v):
+                entry[k] = v[i]
+        per_env.append(entry)
+    return {
+        "ts": time.time(),
+        "latency_s": latency_s,
+        "num_envs": num_envs,
+        "step_ids": request.get("step_ids"),
+        "task_description": request.get("task_description"),
+        "per_env": per_env,
+    }
 
 
 class VLAAdapterPolicy:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
+        if cfg.use_future_conf and not cfg.use_future_pred:
+            raise ValueError("--use_future_conf requires --use_future_pred.")
         if cfg.use_relative_action and cfg.relative_action_mask is None:
             raise ValueError("--use_relative_action requires --relative_action_mask.")
         self.device = torch.device(cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
@@ -152,12 +216,29 @@ class VLAAdapterPolicy:
                 lora_b = pred_head_state["lora_B.default.weight"]
                 pred_head_state = {"weight": base_weight + 2.0 * (lora_b @ lora_a)}
             self.model.pred_head.load_state_dict(pred_head_state)
+            use_future_conf = bool(state.get("use_future_conf", cfg.use_future_conf))
+            if use_future_conf:
+                if "pred_confidence_head" not in state:
+                    raise FileNotFoundError(
+                        "--use_future_conf was set, but pred_components does not contain "
+                        "`pred_confidence_head`."
+                    )
+                self.model.pred_confidence_head.load_state_dict(state["pred_confidence_head"])
             self.model.pred_queries.to(self.device, dtype=torch.bfloat16)
             self.model.pred_head.to(self.device, dtype=torch.bfloat16)
+            self.model.pred_confidence_head.to(self.device, dtype=torch.bfloat16)
             self.model.set_use_future_pred(True)
             pred_before_action = bool(state.get("pred_tokens_before_action", cfg.pred_tokens_before_action))
             self.cfg.pred_tokens_before_action = pred_before_action
             self.model.set_pred_tokens_before_action(pred_before_action)
+            self.cfg.use_future_conf = use_future_conf
+            self.cfg.future_confidence_gamma = float(
+                state.get("future_confidence_gamma", cfg.future_confidence_gamma)
+            )
+            self.model.set_use_future_conf(
+                self.cfg.use_future_conf,
+                self.cfg.future_confidence_gamma,
+            )
             _status("future-pred branch enabled")
 
         self.action_head = None
@@ -181,6 +262,13 @@ class VLAAdapterPolicy:
             f"{self.device}; unnorm_key={self.unnorm_key!r}, "
             f"action_horizon={cfg.action_horizon}, action_dim={cfg.action_dim}"
         )
+        if cfg.confidence_score_log and not cfg.return_confidence:
+            logger.warning(
+                "--confidence-score-log is set but --return_confidence is off; "
+                "no per-step scores will be produced. Enable --return_confidence."
+            )
+        elif cfg.return_confidence and cfg.confidence_score_log:
+            _status(f"per-step confidence scores -> JSONL append: {cfg.confidence_score_log}")
 
     def _resolve_unnorm_key(self, requested: str) -> str:
         norm_stats = getattr(self.model, "norm_stats", {})
@@ -209,6 +297,12 @@ class VLAAdapterPolicy:
             "relative_action_mask": self.cfg.relative_action_mask,
             "use_future_pred": self.cfg.use_future_pred,
             "pred_tokens_before_action": self.cfg.pred_tokens_before_action,
+            "use_future_conf": self.cfg.use_future_conf,
+            "future_confidence_gamma": self.cfg.future_confidence_gamma,
+            "return_confidence": self.cfg.return_confidence,
+            "confidence_threshold": self.cfg.confidence_threshold,
+            "min_action_horizon": self.cfg.min_action_horizon,
+            "confidence_score_log_enabled": bool(self.cfg.confidence_score_log),
         }
 
     def predict_one(self, request: dict[str, Any], env_idx: int) -> np.ndarray:
@@ -257,7 +351,7 @@ class VLAAdapterPolicy:
             logger.info("env %s: inference done, action_chunk shape=%s", env_idx, action_chunk.shape)
         return action_chunk
 
-    def predict_batch(self, request: dict[str, Any], num_envs: int) -> np.ndarray:
+    def predict_batch(self, request: dict[str, Any], num_envs: int) -> tuple[np.ndarray | list[list[list[float]]], dict[str, Any] | None]:
         if self.cfg.debug:
             logger.info("batch: decoding %s envs and building batched observation", num_envs)
 
@@ -324,7 +418,7 @@ class VLAAdapterPolicy:
                     None if proprio is None else proprio.shape,
                 )
 
-            actions, _ = self.model.predict_action(
+            predict_kwargs = dict(
                 **inputs,
                 unnorm_key=self.cfg.unnorm_key,
                 do_sample=False,
@@ -334,6 +428,15 @@ class VLAAdapterPolicy:
                 action_head=self.action_head,
                 use_film=self.cfg.use_film,
             )
+            confidence_info = None
+            if self.cfg.return_confidence:
+                actions, _, confidence_info = self.model.predict_action(
+                    **predict_kwargs,
+                    return_pred_confidence=True,
+                    pred_confidence_cumulative_min=self.cfg.confidence_cumulative_min,
+                )
+            else:
+                actions, _ = self.model.predict_action(**predict_kwargs)
 
         if self.cfg.use_relative_action:
             if proprio_raw is None:
@@ -346,9 +449,46 @@ class VLAAdapterPolicy:
             self.cfg.action_horizon,
             self.cfg.action_dim,
         )
+        response_info = None
+        if confidence_info is not None and "pred_confidence" in confidence_info:
+            confidence = _ensure_confidence_batch(
+                np.asarray(confidence_info["pred_confidence"], dtype=np.float32),
+                num_envs,
+                self.cfg.action_horizon,
+            )
+            effective_horizon = _effective_horizons(
+                confidence,
+                threshold=self.cfg.confidence_threshold,
+                min_horizon=self.cfg.min_action_horizon,
+                max_horizon=self.cfg.action_horizon,
+            )
+            response_info = {
+                "action_confidence": confidence.tolist(),
+                "effective_horizon": effective_horizon.tolist(),
+            }
+            action_payload = _truncate_action_batch(action_batch, effective_horizon)
+            for name in (
+                "raw_pred_confidence",
+                "pred_to_action_attention",
+                "action_attention_mass",
+            ):
+                if name in confidence_info:
+                    response_info[name] = _ensure_confidence_batch(
+                        np.asarray(confidence_info[name], dtype=np.float32),
+                        num_envs,
+                        self.cfg.action_horizon,
+                    ).tolist()
+        else:
+            action_payload = action_batch
         if self.cfg.debug:
-            logger.info("batch: inference done, action_batch shape=%s", action_batch.shape)
-        return action_batch
+            if isinstance(action_payload, np.ndarray):
+                logger.info("batch: inference done, action_batch shape=%s", action_payload.shape)
+            else:
+                logger.info(
+                    "batch: inference done, action lengths=%s",
+                    [len(chunk) for chunk in action_payload],
+                )
+        return action_payload, response_info
 
     def _build_prompt(self, task_label: str) -> str:
         if not self.cfg.use_minivlm:
@@ -503,6 +643,42 @@ def _ensure_action_batch(actions: np.ndarray, num_envs: int, horizon: int, actio
     return np.concatenate([actions, pad], axis=1)
 
 
+def _ensure_confidence_batch(confidence: np.ndarray, num_envs: int, horizon: int) -> np.ndarray:
+    if confidence.ndim == 1:
+        if num_envs != 1:
+            raise ValueError(f"Expected batched confidence for {num_envs} envs, got shape {confidence.shape}.")
+        confidence = confidence[None, :]
+    if confidence.ndim != 2:
+        raise ValueError(f"Expected confidence batch with shape (N, H), got {confidence.shape}.")
+    if confidence.shape[0] != num_envs:
+        raise ValueError(f"Expected num_envs={num_envs}, got confidence batch size {confidence.shape[0]}.")
+    confidence = confidence.astype(np.float32)
+    if confidence.shape[1] >= horizon:
+        return confidence[:, :horizon]
+
+    pad = np.repeat(confidence[:, -1:], horizon - confidence.shape[1], axis=1)
+    return np.concatenate([confidence, pad], axis=1)
+
+
+def _effective_horizons(confidence: np.ndarray, threshold: float, min_horizon: int, max_horizon: int) -> np.ndarray:
+    min_horizon = max(1, min(int(min_horizon), int(max_horizon)))
+    effective = np.full((confidence.shape[0],), int(max_horizon), dtype=np.int64)
+    low_confidence = confidence < float(threshold)
+    for env_idx in range(confidence.shape[0]):
+        low_steps = np.flatnonzero(low_confidence[env_idx])
+        if low_steps.size:
+            effective[env_idx] = max(min_horizon, int(low_steps[0]))
+    return effective
+
+
+def _truncate_action_batch(actions: np.ndarray, effective_horizon: np.ndarray) -> list[list[list[float]]]:
+    truncated: list[list[list[float]]] = []
+    for env_idx, horizon in enumerate(effective_horizon):
+        horizon = int(horizon)
+        truncated.append(actions[env_idx, :horizon].tolist())
+    return truncated
+
+
 CONFIG = ServerConfig()
 POLICY: VLAAdapterPolicy | None = None
 
@@ -553,7 +729,7 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
 
     try:
         num_envs = int(request["num_envs"])
-        stacked = POLICY.predict_batch(request, num_envs)
+        stacked, confidence_info = POLICY.predict_batch(request, num_envs)
     except Exception as exc:
         err = {"error": str(exc), "latency_s": round(time.monotonic() - t0, 4)}
         logger.exception("POST /predict failed")
@@ -561,7 +737,30 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
             _log_predict_debug("POST /predict 输出 (full)", err)
         return err
 
-    out = {"actions": stacked.tolist(), "latency_s": round(time.monotonic() - t0, 4)}
+    actions_payload = stacked.tolist() if isinstance(stacked, np.ndarray) else stacked
+    out = {"actions": actions_payload, "latency_s": round(time.monotonic() - t0, 4)}
+    if confidence_info is not None:
+        out.update(confidence_info)
+
+    if (
+        CONFIG.return_confidence
+        and CONFIG.confidence_score_log
+        and confidence_info is not None
+    ):
+        record = _confidence_log_record(
+            request=request,
+            num_envs=num_envs,
+            latency_s=out["latency_s"],
+            confidence_payload=confidence_info,
+        )
+        log_path = Path(CONFIG.confidence_score_log)
+        _append_confidence_score_log(log_path, record)
+        logger.info(
+            "confidence_scores inference -> %s | %s",
+            log_path,
+            json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str),
+        )
+
     if CONFIG.debug:
         _log_predict_debug("POST /predict 输出 (full)", out)
     return out
@@ -609,6 +808,12 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--use_pro_version", action=argparse.BooleanOptionalAction, default=CONFIG.use_pro_version)
     parser.add_argument("--use_future_pred", action=argparse.BooleanOptionalAction, default=CONFIG.use_future_pred)
     parser.add_argument(
+        "--use_future_conf",
+        action=argparse.BooleanOptionalAction,
+        default=CONFIG.use_future_conf,
+    )
+    parser.add_argument("--future_confidence_gamma", type=float, default=CONFIG.future_confidence_gamma)
+    parser.add_argument(
         "--pred_tokens_before_action",
         action=argparse.BooleanOptionalAction,
         default=CONFIG.pred_tokens_before_action,
@@ -625,6 +830,21 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--compile", action="store_true", default=CONFIG.compile)
     parser.add_argument("--debug", action="store_true", default=CONFIG.debug)
     parser.add_argument("--save-model-images", dest="save_model_images", default=CONFIG.save_model_images, metavar="DIR")
+    parser.add_argument("--return_confidence", action=argparse.BooleanOptionalAction, default=CONFIG.return_confidence)
+    parser.add_argument("--confidence_threshold", type=float, default=CONFIG.confidence_threshold)
+    parser.add_argument("--min_action_horizon", type=int, default=CONFIG.min_action_horizon)
+    parser.add_argument(
+        "--confidence_cumulative_min",
+        action=argparse.BooleanOptionalAction,
+        default=CONFIG.confidence_cumulative_min,
+    )
+    parser.add_argument(
+        "--confidence-score-log",
+        dest="confidence_score_log",
+        default=CONFIG.confidence_score_log,
+        metavar="PATH",
+        help="With --return_confidence: append each inference's per-step scores as one JSON line; also log the same line at INFO.",
+    )
     args = parser.parse_args()
     return ServerConfig(**vars(args))
 

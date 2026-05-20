@@ -877,13 +877,22 @@ def get_vla_action(
             proprio = obs["state"]
 
         
+        return_confidence = bool(getattr(cfg, "return_confidence", False))
+        confidence_kwargs = {}
+        if return_confidence:
+            confidence_kwargs = {
+                "return_pred_confidence": True,
+                "pred_confidence_cumulative_min": getattr(cfg, "confidence_cumulative_min", True),
+            }
+
         # Generate action
+        confidence_info = None
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            result = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False, **confidence_kwargs)
         else:
             # Custom action head for continuous actions
-            action, _ = vla.predict_action(
+            result = vla.predict_action(
                 **inputs,
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
@@ -892,13 +901,26 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                **confidence_kwargs,
             )
+        if return_confidence:
+            action, _, confidence_info = result
+        else:
+            action, _ = result
 
         if getattr(cfg, "use_relative_action", False):
             action = absolute_actions_from_relative(action, raw_state, cfg.relative_action_mask)
 
     # Extract subset of actions for open loop steps
-    return [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]
+    num_steps = min(len(action), cfg.num_open_loop_steps)
+    if confidence_info is not None and "pred_confidence" in confidence_info:
+        confidence = np.asarray(confidence_info["pred_confidence"], dtype=np.float32).reshape(-1)
+        threshold = float(getattr(cfg, "confidence_threshold", 0.65))
+        min_horizon = max(1, min(int(getattr(cfg, "min_action_horizon", 2)), num_steps))
+        low_steps = np.flatnonzero(confidence[:num_steps] < threshold)
+        if low_steps.size:
+            num_steps = max(min_horizon, int(low_steps[0]))
+    return [action[i] for i in range(num_steps)]
 
 
 def get_action_from_server(

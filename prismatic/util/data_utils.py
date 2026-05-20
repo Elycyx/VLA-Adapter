@@ -179,10 +179,15 @@ class PaddedCollatorForActionPrediction:
             pred_mask = pad_sequence(pred_masks, batch_first=True, padding_value=False)
             pred_mask = pred_mask[:, : self.model_max_length]
             output["pred_mask"] = pred_mask
-            output["future_pred_features"] = torch.stack(
-                [instance["future_pred_features"] for instance in instances]
-            )
             output["future_pad_mask"] = torch.stack(
                 [instance["future_pad_mask"] for instance in instances]
             )
+            if "future_pred_features" in instances[0]:
+                output["future_pred_features"] = torch.stack(
+                    [instance["future_pred_features"] for instance in instances]
+                )
+            if "future_recon_pixels" in instances[0]:
+                output["future_recon_pixels"] = torch.stack(
+                    [instance["future_recon_pixels"] for instance in instances]
+                )
         return output

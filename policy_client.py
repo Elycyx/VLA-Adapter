@@ -16,6 +16,14 @@ from typing import Any
 import numpy as np
 
 
+def _decode_actions(actions_json: Any) -> np.ndarray | list[np.ndarray]:
+    """Return ndarray for rectangular chunks, or list of arrays for variable-length chunks."""
+    try:
+        return np.array(actions_json, dtype=np.float32)
+    except ValueError:
+        return [np.asarray(chunk, dtype=np.float32) for chunk in actions_json]
+
+
 def encode_images_base64(
     images_np: list[np.ndarray], fmt: str = "jpeg", quality: int = 90
 ) -> list[str]:
@@ -98,7 +106,8 @@ class PolicyClient:
 
         Returns:
             ``{"actions": np.ndarray (N, H, D), "wall_latency_s": float,
-               "server_latency_s": float}``
+               "server_latency_s": float}``, with optional confidence arrays when
+            the server is launched with ``--return_confidence``.
         """
         t0 = time.monotonic()
         if self.debug:
@@ -113,14 +122,26 @@ class PolicyClient:
         data = resp.json()
         if "error" in data:
             raise RuntimeError(f"Policy server error: {data['error']}")
+        actions = _decode_actions(data["actions"])
         if self.debug:
-            shape = np.array(data["actions"], dtype=np.float32).shape
+            shape = actions.shape if isinstance(actions, np.ndarray) else [chunk.shape for chunk in actions]
             print(f"[policy_client] /predict -> actions shape={shape}, wall={wall:.4f}s", flush=True)
-        return {
-            "actions": np.array(data["actions"], dtype=np.float32),
+        result = {
+            "actions": actions,
             "wall_latency_s": wall,
             "server_latency_s": data.get("latency_s", 0.0),
         }
+        for key in (
+            "action_confidence",
+            "effective_horizon",
+            "raw_pred_confidence",
+            "pred_to_action_attention",
+            "action_attention_mass",
+        ):
+            if key in data:
+                dtype = np.int64 if key == "effective_horizon" else np.float32
+                result[key] = np.array(data[key], dtype=dtype)
+        return result
 
     def predict_async(self, observation: dict[str, Any]) -> Future:
         """Non-blocking inference – returns a ``Future`` resolving to the

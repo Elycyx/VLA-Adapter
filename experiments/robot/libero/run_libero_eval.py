@@ -132,6 +132,12 @@ class GenerateConfig:
     use_future_pred: bool = False                    # If True, loads pred_components and enables the
                                                      # future-vision prediction branch at inference.
     pred_tokens_before_action: bool = False          # If True, pred tokens are inserted before action tokens.
+    use_future_conf: bool = False             # If True, use learned rollout reliability confidence.
+    future_confidence_gamma: float = 1.0              # Target sharpness: t_k = exp(-gamma * detached error).
+    return_confidence: bool = False                  # If True, dynamically truncate chunks using pred confidence.
+    confidence_threshold: float = 0.65               # First step below this confidence starts truncation.
+    min_action_horizon: int = 2                      # Always keep at least this many action steps.
+    confidence_cumulative_min: bool = True
     phase: str = "Inference"
 
 
@@ -146,6 +152,8 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
     if cfg.use_relative_action and cfg.relative_action_mask is None:
         raise ValueError("use_relative_action=True requires relative_action_mask.")
+    if cfg.use_future_conf and not cfg.use_future_pred:
+        raise ValueError("use_future_conf=True requires use_future_pred=True.")
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -174,10 +182,21 @@ def initialize_model(cfg: GenerateConfig):
         state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         model.pred_queries.load_state_dict(state["pred_queries"])
         model.pred_head.load_state_dict(state["pred_head"])
+        use_future_conf = bool(state.get("use_future_conf", cfg.use_future_conf))
+        if use_future_conf:
+            if "pred_confidence_head" not in state:
+                raise FileNotFoundError(
+                    "use_future_conf=True requires pred_confidence_head in pred_components."
+                )
+            model.pred_confidence_head.load_state_dict(state["pred_confidence_head"])
         model.pred_queries.to(model.device, dtype=torch.bfloat16)
         model.pred_head.to(model.device, dtype=torch.bfloat16)
+        model.pred_confidence_head.to(model.device, dtype=torch.bfloat16)
         model.set_use_future_pred(True)
         model.set_pred_tokens_before_action(bool(state.get("pred_tokens_before_action", cfg.pred_tokens_before_action)))
+        cfg.use_future_conf = use_future_conf
+        cfg.future_confidence_gamma = float(state.get("future_confidence_gamma", cfg.future_confidence_gamma))
+        model.set_use_future_conf(cfg.use_future_conf, cfg.future_confidence_gamma)
 
     # Load action head if needed
     action_head = None

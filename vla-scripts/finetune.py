@@ -138,6 +138,9 @@ class FinetuneConfig:
     pred_tokens_before_action: bool = False          # If True, sequence is prompt -> pred -> action.
     future_pred_feature_dir: Optional[Path] = None   # Directory produced by precompute_dinov3_features.py.
     future_pred_loss_weight: float = 1.0             # Weight for the DINOv3 cosine alignment term.
+    use_future_conf: bool = False             # If True, train a future-rollout confidence head.
+    future_conf_loss_weight: float = 1.0       # Weight for the confidence-head regression loss.
+    future_confidence_gamma: float = 1.0              # Target sharpness: t_k = exp(-gamma * detached error).
     # fmt: on
 
 
@@ -531,19 +534,38 @@ def _compute_future_pred_loss(
     mm_pred_mask = torch.zeros(B, S, dtype=torch.bool, device=device_id)
     mm_pred_mask[batch_idx, mm_idx] = True
     pred_h = last_hidden[mm_pred_mask].reshape(B, chunk, -1).to(torch.bfloat16)
-    pred = inner.pred_head(pred_h).float()                            # (B, chunk, DINO_V3_FEATURE_DIM)
+    pred = F.normalize(inner.pred_head(pred_h).float(), dim=-1)       # (B, chunk, DINO_V3_FEATURE_DIM)
+    target = F.normalize(target, dim=-1)
 
-    # Cosine alignment, masked by future_pad_mask. This is the only pred-side loss.
+    # Cosine alignment, masked by future_pad_mask.
     valid = future_pad_mask.float()                                   # (B, chunk)
     cos = F.cosine_similarity(pred, target, dim=-1)                   # (B, chunk)
-    cosine_loss = ((1.0 - cos) * valid).sum() / valid.sum().clamp_min(1.0)
+    cosine_error = (1.0 - cos).float()
+    cosine_loss = (cosine_error * valid).sum() / valid.sum().clamp_min(1.0)
+
     total = cfg.future_pred_loss_weight * cosine_loss
+    if bool(getattr(cfg, "use_future_conf", False)):
+        pred_confidence = inner.pred_confidence_head(pred_h).squeeze(-1).float()
+        confidence_target = torch.exp(
+            -float(getattr(cfg, "future_confidence_gamma", 1.0)) * cosine_error.detach()
+        )
+        confidence_loss = (((pred_confidence - confidence_target) ** 2) * valid).sum() / valid.sum().clamp_min(1.0)
+        total = total + cfg.future_conf_loss_weight * confidence_loss
 
     metrics.update(
         {
             "pred_cosine_loss": cosine_loss.item(),
         }
     )
+    if bool(getattr(cfg, "use_future_conf", False)):
+        valid_count = valid.sum().clamp_min(1.0)
+        metrics.update(
+            {
+                "pred_confidence_loss": confidence_loss.item(),
+                "pred_confidence_mean": ((pred_confidence * valid).sum() / valid_count).item(),
+                "pred_confidence_target_mean": ((confidence_target * valid).sum() / valid_count).item(),
+            }
+        )
     return total
 
 
@@ -672,7 +694,10 @@ def save_training_checkpoint(
                 {
                     "pred_queries": inner.pred_queries.state_dict(),
                     "pred_head": inner.pred_head.state_dict(),
+                    "pred_confidence_head": inner.pred_confidence_head.state_dict(),
                     "pred_tokens_before_action": cfg.pred_tokens_before_action,
+                    "use_future_conf": cfg.use_future_conf,
+                    "future_confidence_gamma": cfg.future_confidence_gamma,
                 },
                 checkpoint_dir / f"pred_components--{checkpoint_name_suffix}",
             )
@@ -827,6 +852,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             "use_future_pred=True requires --future_pred_feature_dir. "
             "Generate it with vla-scripts/precompute_dinov3_features.py first."
         )
+    if cfg.use_future_conf and not cfg.use_future_pred:
+        raise ValueError("use_future_conf=True requires use_future_pred=True.")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.config_file_path = cfg.config_file_path.rstrip("/")
@@ -953,11 +980,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         # the flag survives all wrappers (PEFT/DDP only proxy attribute access via ``base_model``).
         vla.set_use_future_pred(True)
         vla.set_pred_tokens_before_action(cfg.pred_tokens_before_action)
+        if hasattr(vla, "set_use_future_conf"):
+            vla.set_use_future_conf(cfg.use_future_conf, cfg.future_confidence_gamma)
 
     if cfg.use_lora:
-        # Future-pred: keep `pred_head` as a plain Linear (no LoRA) to avoid DDP "marked ready twice"
+        # Future-pred: keep pred heads as plain Linear layers to avoid DDP "marked ready twice"
         # on shared paths. Newer PEFT supports `exclude_modules`; older PEFT needs an explicit
-        # `target_modules` list derived from all Linear layers minus `pred_head`.
+        # `target_modules` list derived from all Linear layers minus the pred heads.
         lora_kw = dict(
             r=cfg.lora_rank,
             lora_alpha=2 * cfg.lora_rank,
@@ -966,12 +995,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         if cfg.use_future_pred and "exclude_modules" in inspect.signature(LoraConfig).parameters:
             lora_kw["target_modules"] = "all-linear"
-            lora_kw["exclude_modules"] = ["pred_head"]
+            lora_kw["exclude_modules"] = ["pred_head", "pred_confidence_head"]
         elif cfg.use_future_pred:
-            suffixes = _lora_target_linear_suffixes_excluding(vla, ("pred_head",))
+            suffixes = _lora_target_linear_suffixes_excluding(vla, ("pred_head", "pred_confidence_head"))
             if not suffixes:
                 raise RuntimeError(
-                    "Could not build LoRA target_modules after excluding pred_head (no Linear layers left?)."
+                    "Could not build LoRA target_modules after excluding pred heads (no Linear layers left?)."
                 )
             lora_kw["target_modules"] = suffixes
         else:
@@ -983,6 +1012,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 param.requires_grad = True
             if cfg.use_future_pred and ("pred_queries" in name or "pred_head" in name):
                 param.requires_grad = True
+            if cfg.use_future_pred and cfg.use_future_conf and "pred_confidence_head" in name:
+                param.requires_grad = True
         vla.print_trainable_parameters()
 
     else:
@@ -990,6 +1021,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             if "action_queries" in name:
                 param.requires_grad = True
             if cfg.use_future_pred and ("pred_queries" in name or "pred_head" in name):
+                param.requires_grad = True
+            if cfg.use_future_pred and cfg.use_future_conf and "pred_confidence_head" in name:
                 param.requires_grad = True
 
     # FiLM setup
@@ -1173,6 +1206,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_future_pred:
         recent_metrics.update({
             "pred_cosine_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        })
+    if cfg.use_future_conf:
+        recent_metrics.update({
+            "pred_confidence_loss": deque(maxlen=cfg.grad_accumulation_steps),
+            "pred_confidence_mean": deque(maxlen=cfg.grad_accumulation_steps),
+            "pred_confidence_target_mean": deque(maxlen=cfg.grad_accumulation_steps),
         })
 
     # Start training

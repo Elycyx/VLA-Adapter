@@ -40,6 +40,8 @@ class RLDSBatchTransform:
     use_future_pred: bool = False
     pred_tokens_before_action: bool = False
     future_pred_feature_dir: Optional[Path] = None
+    load_future_pred_features: bool = True
+    future_recon_size: Optional[Tuple[int, int]] = None
 
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,7 +164,7 @@ class RLDSBatchTransform:
 
         # Future-vision prediction extras
         if self.use_future_pred:
-            if self.future_pred_feature_dir is None:
+            if self.load_future_pred_features and self.future_pred_feature_dir is None:
                 raise ValueError(
                     "use_future_pred=True requires future_pred_feature_dir. "
                     "Run vla-scripts/precompute_dinov3_features.py and pass its output directory."
@@ -182,18 +184,20 @@ class RLDSBatchTransform:
             future_pad_mask = torch.from_numpy(
                 np.asarray(rlds_batch["pad_mask_future_obs"], dtype=np.bool_).copy()
             )
-            future_features = np.stack(
-                [load_feature(self.future_pred_feature_dir, future_imgs[i]) for i in range(future_imgs.shape[0])],
-                axis=0,
-            )
-            if future_features.shape[-1] != DINO_V3_FEATURE_DIM:
-                raise ValueError(
-                    f"Expected cached DINOv3 features with dim {DINO_V3_FEATURE_DIM}, "
-                    f"got {future_features.shape[-1]} from {self.future_pred_feature_dir}."
-                )
             return_dict["pred_mask"] = pred_mask
-            return_dict["future_pred_features"] = torch.from_numpy(future_features).to(torch.float32)
             return_dict["future_pad_mask"] = future_pad_mask
+            return_dict["future_recon_pixels"] = self._future_images_to_rgb_tensor(future_imgs)
+            if self.load_future_pred_features:
+                future_features = np.stack(
+                    [load_feature(self.future_pred_feature_dir, future_imgs[i]) for i in range(future_imgs.shape[0])],
+                    axis=0,
+                )
+                if future_features.shape[-1] != DINO_V3_FEATURE_DIM:
+                    raise ValueError(
+                        f"Expected cached DINOv3 features with dim {DINO_V3_FEATURE_DIM}, "
+                        f"got {future_features.shape[-1]} from {self.future_pred_feature_dir}."
+                    )
+                return_dict["future_pred_features"] = torch.from_numpy(future_features).to(torch.float32)
 
         # Add additional inputs
         if self.use_wrist_image:
@@ -209,6 +213,18 @@ class RLDSBatchTransform:
             return_dict["proprio"] = proprio
 
         return return_dict
+
+    def _future_images_to_rgb_tensor(self, future_imgs: np.ndarray) -> torch.Tensor:
+        """Convert future uint8 RGB frames to (chunk, 3, H, W) float tensors in [0, 1]."""
+        frames = []
+        for i in range(future_imgs.shape[0]):
+            frame = Image.fromarray(future_imgs[i])
+            if self.future_recon_size is not None:
+                height, width = self.future_recon_size
+                frame = frame.resize((width, height), resample=Image.BILINEAR)
+            array = np.asarray(frame, dtype=np.float32) / 255.0
+            frames.append(torch.from_numpy(array).permute(2, 0, 1))
+        return torch.stack(frames, dim=0)
     
     
 
