@@ -36,6 +36,7 @@ def chunk_act_obs(
     """
     traj_len = tf.shape(traj["action"])[0]
     effective_traj_len = traj_len
+    primary_image_for_future = traj["observation"].get("image_primary", None)
     chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
     )
@@ -70,7 +71,7 @@ def chunk_act_obs(
     # NOTE: We store these at the top level (sibling to "observation") so the frame-level `dl.vmap`
     # pipeline that decodes/augments observation images does not see them (mixing leading dims would
     # break vmap). A dedicated frame transform decodes/resizes them later.
-    if future_obs_window_size > 0 and "image_primary" in traj["observation"]:
+    if future_obs_window_size > 0 and primary_image_for_future is not None:
         future_obs_indices = tf.broadcast_to(
             tf.range(1, 1 + future_obs_window_size),
             [effective_traj_len, future_obs_window_size],
@@ -80,9 +81,7 @@ def chunk_act_obs(
         )
         floored_future_obs_indices = tf.minimum(tf.maximum(future_obs_indices, 0), goal_timestep[:, None])
         # Only gather the primary image (wrist views are not used as prediction targets).
-        traj["image_primary_future"] = tf.gather(
-            traj["observation"]["image_primary"], floored_future_obs_indices
-        )
+        traj["image_primary_future"] = tf.gather(primary_image_for_future, floored_future_obs_indices)
         traj["pad_mask_future_obs"] = future_obs_indices <= goal_timestep[:, None]
 
     # Truncate other elements of the trajectory dict

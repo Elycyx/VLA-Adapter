@@ -228,6 +228,81 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         """Sets the number of input images for the vision backbone."""
         self.vision_backbone.set_num_images_in_input(num_images_in_input)
 
+    def get_num_temporal_frames(self) -> int:
+        """Returns the number of temporal frames per camera view."""
+        if hasattr(self.vision_backbone, "get_num_temporal_frames"):
+            return self.vision_backbone.get_num_temporal_frames()
+        return 1
+
+    def set_num_temporal_frames(self, num_temporal_frames: int) -> None:
+        """Sets the number of temporal frames per camera view."""
+        if hasattr(self.vision_backbone, "set_num_temporal_frames"):
+            self.vision_backbone.set_num_temporal_frames(num_temporal_frames)
+
+    def get_temporal_fusion_type(self) -> str:
+        """Returns the temporal fusion implementation."""
+        if hasattr(self.vision_backbone, "get_temporal_fusion_type"):
+            return self.vision_backbone.get_temporal_fusion_type()
+        return "attention"
+
+    def set_temporal_fusion_type(self, temporal_fusion_type: str) -> None:
+        """Sets the temporal fusion implementation."""
+        if hasattr(self.vision_backbone, "set_temporal_fusion_type"):
+            self.vision_backbone.set_temporal_fusion_type(temporal_fusion_type)
+
+    def get_use_current_query_attention(self) -> bool:
+        """Returns whether attention fusion uses current-frame queries only."""
+        if hasattr(self.vision_backbone, "get_use_current_query_attention"):
+            return self.vision_backbone.get_use_current_query_attention()
+        return False
+
+    def set_use_current_query_attention(self, use_current_query_attention: bool) -> None:
+        """Sets whether attention fusion uses current-frame queries only."""
+        if hasattr(self.vision_backbone, "set_use_current_query_attention"):
+            self.vision_backbone.set_use_current_query_attention(use_current_query_attention)
+
+    def get_use_mid_layer_temporal_fusion(self) -> bool:
+        """Returns whether temporal fusion uses middle-layer features."""
+        if hasattr(self.vision_backbone, "get_use_mid_layer_temporal_fusion"):
+            return self.vision_backbone.get_use_mid_layer_temporal_fusion()
+        return False
+
+    def set_use_mid_layer_temporal_fusion(self, use_mid_layer_temporal_fusion: bool) -> None:
+        """Sets whether temporal fusion uses middle-layer features."""
+        if hasattr(self.vision_backbone, "set_use_mid_layer_temporal_fusion"):
+            self.vision_backbone.set_use_mid_layer_temporal_fusion(use_mid_layer_temporal_fusion)
+
+    @staticmethod
+    def _temporal_mid_layer_index(featurizer) -> int:
+        final_idx = max(0, len(featurizer.blocks) - 2)
+        return max(0, final_idx // 2)
+
+    def _forward_fused_image_middle_and_final(
+        self,
+        img: torch.Tensor,
+        average_language_embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+        mid_idx = self._temporal_mid_layer_index(self.vision_backbone.featurizer)
+        final_idx = max(0, len(self.vision_backbone.featurizer.blocks) - 2)
+        fused_mid_idx = self._temporal_mid_layer_index(self.vision_backbone.fused_featurizer)
+        fused_final_idx = max(0, len(self.vision_backbone.fused_featurizer.blocks) - 2)
+        patches_mid, patches_final = self.vision_backbone.featurizer.get_intermediate_layers(
+            img_regular, average_language_embedding, n={mid_idx, final_idx}
+        )
+        patches_fused_mid, patches_fused_final = self.vision_backbone.fused_featurizer.get_intermediate_layers(
+            img_fused, average_language_embedding, n={fused_mid_idx, fused_final_idx}
+        )
+        middle = torch.cat([patches_mid, patches_fused_mid], dim=2)
+        final = torch.cat([patches_final, patches_fused_final], dim=2)
+        return middle, final
+
+    def _forward_fused_image(self, img: torch.Tensor, average_language_embedding: torch.Tensor) -> torch.Tensor:
+        img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+        patches = self.vision_backbone.featurizer(img_regular, average_language_embedding)
+        patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
+        return torch.cat([patches, patches_fused], dim=2)
+
     def forward(self, pixel_values: torch.Tensor, language_embeddings: torch.Tensor) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone with FiLM to infuse language inputs into visual features.
@@ -241,36 +316,54 @@ class FiLMedPrismaticVisionBackbone(nn.Module):
         # For FiLM: Average the language embeddings of the task description
         average_language_embedding = language_embeddings.mean(dim=1)
 
-        if self.get_num_images_in_input() == 1:
+        num_images = self.get_num_images_in_input()
+        num_frames = self.get_num_temporal_frames()
+
+        if num_images == 1 and num_frames == 1:
             if not self.vision_backbone.use_fused_vision_backbone:
                 return self.vision_backbone.featurizer(pixel_values, average_language_embedding)
 
             # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
-            img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
-            patches = self.vision_backbone.featurizer(img, average_language_embedding)
-            patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
-
-            return torch.cat([patches, patches_fused], dim=2)
+            return self._forward_fused_image(pixel_values, average_language_embedding)
 
         else:
-            assert self.vision_backbone.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
+            assert self.vision_backbone.use_fused_vision_backbone, "Multi-image or multi-frame inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
-            images = torch.split(pixel_values, [6] * self.get_num_images_in_input(), dim=1)
+            expected_images = num_images * num_frames
+            expected_channels = 6 * expected_images
+            if pixel_values.shape[1] != expected_channels:
+                raise ValueError(
+                    f"Expected pixel_values with {expected_channels} channels "
+                    f"({num_images} view(s) * {num_frames} frame(s) * 6), got {pixel_values.shape[1]}."
+                )
+            images = torch.split(pixel_values, [6] * expected_images, dim=1)
 
             # Process each image and collect patches
             all_patches = []
+            use_mid_layer_fusion = self.get_use_mid_layer_temporal_fusion() and num_frames > 1
+            all_middle_patches = [] if use_mid_layer_fusion else None
             for img in images:
-                # Split each image further into two stacks of channels (each with 3 channels)
-                img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+                if all_middle_patches is None:
+                    all_patches.append(self._forward_fused_image(img, average_language_embedding))
+                else:
+                    middle_patches, final_patches = self._forward_fused_image_middle_and_final(
+                        img, average_language_embedding
+                    )
+                    all_middle_patches.append(middle_patches)
+                    all_patches.append(final_patches)
 
-                # Get patches from both SigLIP and DINOv2 vision transformers
-                patches = self.vision_backbone.featurizer(img_regular, average_language_embedding)
-                patches_fused = self.vision_backbone.fused_featurizer(img_fused, average_language_embedding)
+            if num_frames == 1:
+                return torch.cat(all_patches, dim=1)
 
-                # Concatenate SigLIP and DINOv2 patches along the hidden dimension
-                combined_patches = torch.cat([patches, patches_fused], dim=2)
-                all_patches.append(combined_patches)
-
-            # Concatenate all patches along the patch dimension
-            return torch.cat(all_patches, dim=1)
+            patch_stack = torch.stack(all_patches, dim=1)
+            bsz, _, num_patches, dim = patch_stack.shape
+            patch_stack = patch_stack.reshape(bsz, num_images, num_frames, num_patches, dim)
+            if all_middle_patches is not None:
+                middle_patch_stack = torch.stack(all_middle_patches, dim=1).reshape(
+                    bsz, num_images, num_frames, num_patches, dim
+                )
+                temporal_delta = self.vision_backbone.temporal_patch_attention(middle_patch_stack, return_delta=True)
+                current_final = patch_stack[:, :, -1].reshape(bsz, num_images * num_patches, dim)
+                return current_final + temporal_delta
+            return self.vision_backbone.temporal_patch_attention(patch_stack)

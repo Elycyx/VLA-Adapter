@@ -60,6 +60,10 @@ class ServerConfig:
     unnorm_key: str = ""
     control_mode: str = "joint_pos"
     num_images_in_input: int = 2
+    num_temporal_frames: int = 1
+    temporal_fusion_type: str = "attention"
+    use_current_query_temporal_attention: bool = False
+    use_mid_layer_temporal_fusion: bool = False
     action_horizon: int = 8
     action_dim: int = 8
     proprio_dim: int = 8
@@ -154,6 +158,8 @@ class VLAAdapterPolicy:
             raise ValueError("--use_future_conf requires --use_future_pred.")
         if cfg.use_relative_action and cfg.relative_action_mask is None:
             raise ValueError("--use_relative_action requires --relative_action_mask.")
+        if cfg.num_temporal_frames < 1:
+            raise ValueError("--num_temporal_frames must be >= 1.")
         self.device = torch.device(cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
 
         # Import after parsing robot_platform so prismatic.vla.constants chooses
@@ -293,6 +299,10 @@ class VLAAdapterPolicy:
             "proprio_dim": self.cfg.proprio_dim,
             "unnorm_key": self.unnorm_key,
             "num_images_in_input": self.cfg.num_images_in_input,
+            "num_temporal_frames": self.cfg.num_temporal_frames,
+            "temporal_fusion_type": self.cfg.temporal_fusion_type,
+            "use_current_query_temporal_attention": self.cfg.use_current_query_temporal_attention,
+            "use_mid_layer_temporal_fusion": self.cfg.use_mid_layer_temporal_fusion,
             "use_relative_action": self.cfg.use_relative_action,
             "relative_action_mask": self.cfg.relative_action_mask,
             "use_future_pred": self.cfg.use_future_pred,
@@ -309,13 +319,20 @@ class VLAAdapterPolicy:
         if self.cfg.debug:
             logger.info("env %s: decoding images and building observation", env_idx)
 
-        obs = {
-            "full_image": _select_image(request, env_idx, ("fixed_cam", "static", "rgb_static", "image", "full_image")),
-        }
+        num_temporal_frames = int(self.cfg.num_temporal_frames)
+        primary_frames = _select_image_frames(
+            request,
+            env_idx,
+            ("fixed_cam", "static", "rgb_static", "image", "full_image"),
+            num_temporal_frames,
+        )
+        wrist_frame_lists = _select_wrist_image_frames(request, env_idx, num_temporal_frames)
 
-        wrist_images = _select_wrist_images(request, env_idx)
-        for i, image in enumerate(wrist_images):
-            obs[f"wrist_{i}"] = image
+        obs = {
+            "full_image": primary_frames if num_temporal_frames > 1 else primary_frames[-1],
+        }
+        for i, frames in enumerate(wrist_frame_lists):
+            obs[f"wrist_{i}"] = frames if num_temporal_frames > 1 else frames[-1]
 
         if len(obs) < self.cfg.num_images_in_input:
             raise ValueError(
@@ -355,14 +372,20 @@ class VLAAdapterPolicy:
         if self.cfg.debug:
             logger.info("batch: decoding %s envs and building batched observation", num_envs)
 
-        primary_images = [
-            _select_image(request, i, ("fixed_cam", "static", "rgb_static", "image", "full_image"))
+        num_temporal_frames = int(self.cfg.num_temporal_frames)
+        temporal_primary_by_env = [
+            _select_image_frames(
+                request,
+                i,
+                ("fixed_cam", "static", "rgb_static", "image", "full_image"),
+                num_temporal_frames,
+            )
             for i in range(num_envs)
         ]
-        wrist_images_by_env = [_select_wrist_images(request, i) for i in range(num_envs)]
+        temporal_wrist_by_env = [_select_wrist_image_frames(request, i, num_temporal_frames) for i in range(num_envs)]
 
-        for i, wrist_images in enumerate(wrist_images_by_env):
-            supplied = 1 + len(wrist_images)
+        for i, wrist_frame_lists in enumerate(temporal_wrist_by_env):
+            supplied = 1 + len(wrist_frame_lists)
             if supplied < self.cfg.num_images_in_input:
                 raise ValueError(
                     f"Env {i} supplied {supplied} image(s), but the model expects {self.cfg.num_images_in_input}."
@@ -370,10 +393,10 @@ class VLAAdapterPolicy:
 
         if self.cfg.save_model_images:
             out_dir = Path(self.cfg.save_model_images)
-            for env_idx, primary in enumerate(primary_images):
-                obs = {"full_image": primary}
-                for wrist_idx, wrist in enumerate(wrist_images_by_env[env_idx]):
-                    obs[f"wrist_{wrist_idx}"] = wrist
+            for env_idx, primary_frames in enumerate(temporal_primary_by_env):
+                obs = {"full_image": primary_frames[-1]}
+                for wrist_idx, wrist_frames in enumerate(temporal_wrist_by_env[env_idx]):
+                    obs[f"wrist_{wrist_idx}"] = wrist_frames[-1]
                 _save_policy_input_images(obs, out_dir, env_idx)
 
         task_description = request.get("task_description", "")
@@ -383,24 +406,37 @@ class VLAAdapterPolicy:
             prompts = [self._build_prompt(str(task_description)) for _ in range(num_envs)]
 
         with torch.inference_mode():
-            processed_primary = self._prepare_images_for_vla(primary_images, self.cfg)
+            processed_primary = self._prepare_images_for_vla(
+                [frames[-1] for frames in temporal_primary_by_env],
+                self.cfg,
+            )
             inputs = self.processor(prompts, processed_primary, padding=True).to(self.device, dtype=torch.bfloat16)
 
-            wrist_slots = min(max((len(images) for images in wrist_images_by_env), default=0), self.cfg.num_images_in_input - 1)
-            wrist_pixel_values = []
+            wrist_slots = min(
+                max((len(wrist_frames) for wrist_frames in temporal_wrist_by_env), default=0),
+                self.cfg.num_images_in_input - 1,
+            )
+            pixel_value_chunks = []
+            for frame_idx in range(num_temporal_frames):
+                frame_images = [frames[frame_idx] for frames in temporal_primary_by_env]
+                processed_frame = self._prepare_images_for_vla(frame_images, self.cfg)
+                frame_inputs = self.processor(prompts, processed_frame, padding=True).to(self.device, dtype=torch.bfloat16)
+                pixel_value_chunks.append(frame_inputs["pixel_values"])
+
             for slot in range(wrist_slots):
-                slot_images = []
-                for env_idx, env_wrist_images in enumerate(wrist_images_by_env):
-                    if slot >= len(env_wrist_images):
-                        raise ValueError(f"Env {env_idx} is missing wrist image slot {slot}.")
-                    slot_images.append(env_wrist_images[slot])
+                for frame_idx in range(num_temporal_frames):
+                    slot_images = []
+                    for env_idx, env_wrist_frames in enumerate(temporal_wrist_by_env):
+                        if slot >= len(env_wrist_frames):
+                            raise ValueError(f"Env {env_idx} is missing wrist image slot {slot}.")
+                        slot_images.append(env_wrist_frames[slot][frame_idx])
 
-                processed_slot = self._prepare_images_for_vla(slot_images, self.cfg)
-                slot_inputs = self.processor(prompts, processed_slot, padding=True).to(self.device, dtype=torch.bfloat16)
-                wrist_pixel_values.append(slot_inputs["pixel_values"])
+                    processed_slot = self._prepare_images_for_vla(slot_images, self.cfg)
+                    slot_inputs = self.processor(prompts, processed_slot, padding=True).to(self.device, dtype=torch.bfloat16)
+                    pixel_value_chunks.append(slot_inputs["pixel_values"])
 
-            if wrist_pixel_values:
-                inputs["pixel_values"] = torch.cat([inputs["pixel_values"]] + wrist_pixel_values, dim=1)
+            if pixel_value_chunks:
+                inputs["pixel_values"] = torch.cat(pixel_value_chunks, dim=1)
 
             proprio = None
             proprio_raw = None
@@ -515,6 +551,39 @@ def _describe_b64_blob(blob: Any) -> dict[str, Any]:
     return {"base64_chars": len(s), "sha256_12": digest}
 
 
+def _describe_image_entry(entry: Any) -> Any:
+    if isinstance(entry, list):
+        return [_describe_b64_blob(blob) for blob in entry]
+    return _describe_b64_blob(entry)
+
+
+def _decode_image_entry(entry: Any, num_temporal_frames: int, camera_name: str, env_idx: int) -> list[np.ndarray]:
+    """Decode one env's camera entry: either a single base64 string or a temporal frame list."""
+    if isinstance(entry, str):
+        if num_temporal_frames > 1:
+            raise ValueError(
+                f"Env {env_idx} camera {camera_name!r} sent a single image, but the server expects "
+                f"{num_temporal_frames} temporal frames per camera. "
+                f"Send a list like [prev_frame_b64, curr_frame_b64]."
+            )
+        return [decode_image(entry)]
+
+    if isinstance(entry, list):
+        if not entry:
+            raise ValueError(f"Env {env_idx} camera {camera_name!r} has an empty temporal frame list.")
+        if len(entry) != num_temporal_frames:
+            raise ValueError(
+                f"Env {env_idx} camera {camera_name!r} sent {len(entry)} frame(s), "
+                f"but num_temporal_frames={num_temporal_frames}."
+            )
+        return [decode_image(blob) for blob in entry]
+
+    raise ValueError(
+        f"Env {env_idx} camera {camera_name!r} must be a base64 string or a list of base64 strings, "
+        f"got {type(entry).__name__}."
+    )
+
+
 def _redact_predict_request_for_debug(request: dict[str, Any]) -> dict[str, Any]:
     """用于 debug：保留除 images 外的原始字段；images 只保留元信息，不打印 base64。"""
     out = dict(request)
@@ -523,7 +592,7 @@ def _redact_predict_request_for_debug(request: dict[str, Any]) -> dict[str, Any]
         redacted: dict[str, Any] = {}
         for cam, blobs in images.items():
             if isinstance(blobs, list):
-                redacted[cam] = [_describe_b64_blob(b) for b in blobs]
+                redacted[cam] = [_describe_image_entry(b) for b in blobs]
             else:
                 redacted[cam] = blobs
         out["images"] = redacted
@@ -551,37 +620,48 @@ def _save_policy_input_images(obs: dict[str, Any], out_dir: Path, env_idx: int) 
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for name, value in obs.items():
+        if isinstance(value, list):
+            value = value[-1] if value else None
         if not isinstance(value, np.ndarray) or value.ndim != 3:
             continue
         Image.fromarray(value).save(out_dir / f"{seq:08d}_{name}_env{env_idx}.png")
 
 
-def _select_image(request: dict[str, Any], env_idx: int, preferred_keys: tuple[str, ...]) -> np.ndarray:
+def _select_image_frames(
+    request: dict[str, Any],
+    env_idx: int,
+    preferred_keys: tuple[str, ...],
+    num_temporal_frames: int,
+) -> list[np.ndarray]:
     images = request.get("images", {})
     for key in preferred_keys:
         values = images.get(key)
         if values is not None:
-            return decode_image(values[env_idx])
+            return _decode_image_entry(values[env_idx], num_temporal_frames, key, env_idx)
     raise ValueError(f"Missing primary image. Expected one of: {preferred_keys}")
 
 
-def _select_wrist_images(request: dict[str, Any], env_idx: int) -> list[np.ndarray]:
+def _select_wrist_image_frames(
+    request: dict[str, Any],
+    env_idx: int,
+    num_temporal_frames: int,
+) -> list[list[np.ndarray]]:
     images = request.get("images", {})
     preferred = ("wrist_cam", "gripper", "rgb_gripper", "wrist_image")
-    selected: list[np.ndarray] = []
+    selected: list[list[np.ndarray]] = []
     used: set[str] = set()
 
     for key in preferred:
         values = images.get(key)
         if values is not None:
-            selected.append(decode_image(values[env_idx]))
+            selected.append(_decode_image_entry(values[env_idx], num_temporal_frames, key, env_idx))
             used.add(key)
 
     for key in sorted(images.keys()):
         if key in used or key in {"fixed_cam", "static", "rgb_static", "image", "full_image"}:
             continue
         if "wrist" in key or "gripper" in key:
-            selected.append(decode_image(images[key][env_idx]))
+            selected.append(_decode_image_entry(images[key][env_idx], num_temporal_frames, key, env_idx))
 
     return selected
 
@@ -797,6 +877,18 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--unnorm_key", default=CONFIG.unnorm_key)
     parser.add_argument("--control_mode", default=CONFIG.control_mode)
     parser.add_argument("--num_images_in_input", type=int, default=CONFIG.num_images_in_input)
+    parser.add_argument("--num_temporal_frames", type=int, default=CONFIG.num_temporal_frames)
+    parser.add_argument("--temporal_fusion_type", default=CONFIG.temporal_fusion_type, choices=("attention", "delta_mlp"))
+    parser.add_argument(
+        "--use_current_query_temporal_attention",
+        action=argparse.BooleanOptionalAction,
+        default=CONFIG.use_current_query_temporal_attention,
+    )
+    parser.add_argument(
+        "--use_mid_layer_temporal_fusion",
+        action=argparse.BooleanOptionalAction,
+        default=CONFIG.use_mid_layer_temporal_fusion,
+    )
     parser.add_argument("--action_horizon", type=int, default=CONFIG.action_horizon)
     parser.add_argument("--action_dim", type=int, default=CONFIG.action_dim)
     parser.add_argument("--proprio_dim", type=int, default=CONFIG.proprio_dim)

@@ -87,6 +87,10 @@ class FinetuneConfig:
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for training 
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
+    num_temporal_frames: int = 1                     # Number of temporal frames per camera view (1 preserves legacy behavior)
+    temporal_fusion_type: str = "attention"          # Temporal fusion: "attention" or "delta_mlp"
+    use_current_query_temporal_attention: bool = False # If True, attention fusion updates current-frame tokens only
+    use_mid_layer_temporal_fusion: bool = False      # If True, temporal fusion uses middle-layer vision features
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     use_relative_action: bool = False                # If True, train selected action dims as action - state deltas
     relative_action_mask: Optional[str] = None        # Comma-separated bool mask, e.g. true,true,false
@@ -180,6 +184,85 @@ def _lora_target_linear_suffixes_excluding(module: nn.Module, exclude_name_subst
             continue
         suffixes.add(name.rsplit(".", 1)[-1])
     return sorted(suffixes)
+
+
+def _unwrap_peft_model(model: nn.Module) -> nn.Module:
+    """Return the underlying HF model when wrapped by PEFT."""
+    return model.base_model.model if model.__class__.__name__ in ("PeftModel", "PeftModelForCausalLM") else model
+
+
+def _get_temporal_patch_attention(model: nn.Module) -> Optional[nn.Module]:
+    """Fetch the temporal fusion module from plain, PEFT, or DDP-wrapped VLA models."""
+    base = model.module if hasattr(model, "module") else model
+    inner = _unwrap_peft_model(base)
+    vision_backbone = getattr(inner, "vision_backbone", None)
+    if hasattr(vision_backbone, "vision_backbone"):
+        vision_backbone = vision_backbone.vision_backbone
+    return getattr(vision_backbone, "temporal_patch_attention", None)
+
+
+def _mark_temporal_patch_attention_trainable(model: nn.Module) -> None:
+    temporal = _get_temporal_patch_attention(model)
+    if temporal is None:
+        return
+    for param in temporal.parameters():
+        param.requires_grad = True
+
+
+def _merge_lora_linear_state(module: nn.Module) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return plain Linear weights for a PEFT LoRA-wrapped Linear or an ordinary Linear."""
+    if not hasattr(module, "base_layer"):
+        return module.weight.detach().clone(), None if module.bias is None else module.bias.detach().clone()
+
+    base_layer = module.base_layer
+    weight = base_layer.weight.detach().clone()
+    bias = None if base_layer.bias is None else base_layer.bias.detach().clone()
+
+    lora_a = getattr(module, "lora_A", {})
+    lora_b = getattr(module, "lora_B", {})
+    scaling = getattr(module, "scaling", {})
+    for adapter_name, adapter_a in lora_a.items():
+        if adapter_name not in lora_b:
+            continue
+        scale = scaling.get(adapter_name, 1.0) if isinstance(scaling, dict) else scaling
+        delta = lora_b[adapter_name].weight.detach().to(weight.dtype) @ adapter_a.weight.detach().to(weight.dtype)
+        weight = weight + delta * scale
+    return weight, bias
+
+
+def _plain_temporal_patch_attention_state_dict(temporal: nn.Module) -> dict:
+    """Build a non-LoRA state dict for temporal_patch_attention."""
+    plain_state = {}
+    for key, value in temporal.state_dict().items():
+        if ".base_layer." in key or ".lora_A." in key or ".lora_B." in key:
+            continue
+        plain_state[key] = value.detach().clone()
+
+    for module_name, module in temporal.named_modules():
+        if module_name == "" or not hasattr(module, "base_layer"):
+            continue
+        weight, bias = _merge_lora_linear_state(module)
+        plain_state[f"{module_name}.weight"] = weight
+        if bias is not None:
+            plain_state[f"{module_name}.bias"] = bias
+    return plain_state
+
+
+def _strip_lora_from_temporal_patch_attention(model: nn.Module) -> None:
+    """Keep temporal fusion as ordinary trainable layers even when PEFT targets all linear modules."""
+    temporal = _get_temporal_patch_attention(model)
+    if temporal is None:
+        return
+
+    def strip(module: nn.Module) -> None:
+        for child_name, child in list(module.named_children()):
+            if hasattr(child, "base_layer"):
+                setattr(module, child_name, child.base_layer)
+            else:
+                strip(child)
+
+    strip(temporal)
+    _mark_temporal_patch_attention_trainable(model)
 
 
 def get_run_id(cfg) -> str:
@@ -687,9 +770,16 @@ def save_training_checkpoint(
         if cfg.use_l1_regression and action_head is not None:
             torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
 
+        temporal_patch_attention = _get_temporal_patch_attention(vla)
+        if temporal_patch_attention is not None and cfg.num_temporal_frames > 1:
+            torch.save(
+                _plain_temporal_patch_attention_state_dict(temporal_patch_attention),
+                checkpoint_dir / f"temporal_patch_attention--{checkpoint_name_suffix}",
+            )
+
         if cfg.use_future_pred:
             base = vla.module
-            inner = base.base_model.model if base.__class__.__name__ in ("PeftModel", "PeftModelForCausalLM") else base
+            inner = _unwrap_peft_model(base)
             torch.save(
                 {
                     "pred_queries": inner.pred_queries.state_dict(),
@@ -726,6 +816,10 @@ def save_training_checkpoint(
             cfg.config_file_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False, trust_remote_code=False
         )
 
+        trained_temporal = _get_temporal_patch_attention(vla)
+        base_temporal = _get_temporal_patch_attention(base_vla)
+        if trained_temporal is not None and base_temporal is not None and cfg.num_temporal_frames > 1:
+            base_temporal.load_state_dict(_plain_temporal_patch_attention_state_dict(trained_temporal))
 
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -972,6 +1066,14 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    if hasattr(vla.vision_backbone, "set_num_temporal_frames"):
+        vla.vision_backbone.set_num_temporal_frames(cfg.num_temporal_frames)
+    if hasattr(vla.vision_backbone, "set_temporal_fusion_type"):
+        vla.vision_backbone.set_temporal_fusion_type(cfg.temporal_fusion_type)
+    if hasattr(vla.vision_backbone, "set_use_current_query_attention"):
+        vla.vision_backbone.set_use_current_query_attention(cfg.use_current_query_temporal_attention)
+    if hasattr(vla.vision_backbone, "set_use_mid_layer_temporal_fusion"):
+        vla.vision_backbone.set_use_mid_layer_temporal_fusion(cfg.use_mid_layer_temporal_fusion)
 
     # vla.set_version(cfg.version)
 
@@ -993,20 +1095,32 @@ def finetune(cfg: FinetuneConfig) -> None:
             lora_dropout=cfg.lora_dropout,
             init_lora_weights="gaussian",
         )
-        if cfg.use_future_pred and "exclude_modules" in inspect.signature(LoraConfig).parameters:
+        lora_exclude_modules = ["temporal_patch_attention"]
+        if cfg.use_future_pred:
+            lora_exclude_modules.extend(["pred_head", "pred_confidence_head"])
+
+        if "exclude_modules" in inspect.signature(LoraConfig).parameters:
             lora_kw["target_modules"] = "all-linear"
-            lora_kw["exclude_modules"] = ["pred_head", "pred_confidence_head"]
+            lora_kw["exclude_modules"] = lora_exclude_modules
         elif cfg.use_future_pred:
-            suffixes = _lora_target_linear_suffixes_excluding(vla, ("pred_head", "pred_confidence_head"))
+            suffixes = _lora_target_linear_suffixes_excluding(
+                vla,
+                ("pred_head", "pred_confidence_head", "temporal_patch_attention"),
+            )
             if not suffixes:
                 raise RuntimeError(
                     "Could not build LoRA target_modules after excluding pred heads (no Linear layers left?)."
                 )
             lora_kw["target_modules"] = suffixes
         else:
-            lora_kw["target_modules"] = "all-linear"
+            suffixes = _lora_target_linear_suffixes_excluding(vla, ("temporal_patch_attention",))
+            if suffixes:
+                lora_kw["target_modules"] = suffixes
+            else:
+                lora_kw["target_modules"] = "all-linear"
         lora_config = LoraConfig(**lora_kw)
         vla = get_peft_model(vla, lora_config)
+        _strip_lora_from_temporal_patch_attention(vla)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
@@ -1017,6 +1131,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.print_trainable_parameters()
 
     else:
+        _mark_temporal_patch_attention_trainable(vla)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
@@ -1139,6 +1254,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_future_pred=cfg.use_future_pred,
         pred_tokens_before_action=cfg.pred_tokens_before_action,
         future_pred_feature_dir=cfg.future_pred_feature_dir,
+        num_temporal_frames=cfg.num_temporal_frames,
         )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1150,6 +1266,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_relative_action=cfg.use_relative_action,
         relative_action_mask=cfg.relative_action_mask,
         use_future_pred=cfg.use_future_pred,
+        num_temporal_frames=cfg.num_temporal_frames,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1163,6 +1280,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             use_relative_action=cfg.use_relative_action,
             relative_action_mask=cfg.relative_action_mask,
             use_future_pred=cfg.use_future_pred,
+            num_temporal_frames=cfg.num_temporal_frames,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

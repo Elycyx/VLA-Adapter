@@ -70,6 +70,115 @@ def ls_apply_patch(ls_module: LayerScale):
 
 
 # === Prismatic Vision Backbone (nn.Module) Definitions (w/ Fused Backbone Support) ===
+class CausalTemporalPatchAttention(nn.Module):
+    """Temporal fusion over same-location patches, then keep the current frame."""
+
+    def __init__(self, vision_dim: int, temporal_dim: int = 256) -> None:
+        super().__init__()
+        temporal_dim = min(temporal_dim, vision_dim)
+        attn_dim = temporal_dim
+        if attn_dim >= 4:
+            attn_dim -= attn_dim % 4
+        attn_dim = max(1, attn_dim)
+        num_heads = 4 if attn_dim >= 4 and attn_dim % 4 == 0 else 1
+        temporal_dim = max(1, temporal_dim)
+        self.fusion_type = "attention"
+        self.use_current_query_attention = False
+
+        self.attn_norm = nn.LayerNorm(vision_dim)
+        self.down_proj = nn.Linear(vision_dim, attn_dim)
+        self.temporal_attn = nn.MultiheadAttention(attn_dim, num_heads=num_heads, batch_first=True)
+        self.up_proj = nn.Linear(attn_dim, vision_dim)
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
+
+        self.delta_norm = nn.LayerNorm(vision_dim * 2)
+        self.delta_fc1 = nn.Linear(vision_dim * 2, temporal_dim)
+        self.delta_act = nn.GELU()
+        self.delta_fc2 = nn.Linear(temporal_dim, vision_dim)
+        self.delta_gate = nn.Parameter(torch.tensor(0.1))
+        nn.init.zeros_(self.delta_fc2.weight)
+        nn.init.zeros_(self.delta_fc2.bias)
+
+    def set_fusion_type(self, fusion_type: str) -> None:
+        normalized = fusion_type.replace("-", "_").lower()
+        if normalized in {"delta", "delta_mlp"}:
+            normalized = "delta_mlp"
+        elif normalized != "attention":
+            raise ValueError(f"Unsupported temporal_fusion_type={fusion_type!r}; use 'attention' or 'delta_mlp'.")
+        self.fusion_type = normalized
+
+    def set_use_current_query_attention(self, use_current_query_attention: bool) -> None:
+        self.use_current_query_attention = bool(use_current_query_attention)
+
+    def forward(self, patches: torch.Tensor, return_delta: bool = False) -> torch.Tensor:
+        """
+        Args:
+            patches: (B, V, T, P, D), view-major temporal patch features.
+
+        Returns:
+            (B, V * P, D), current-frame tokens enriched by past frames.
+        """
+        bsz, num_views, num_frames, num_patches, dim = patches.shape
+        if num_frames == 1:
+            current = patches[:, :, -1]
+            if return_delta:
+                return torch.zeros_like(current).reshape(bsz, num_views * num_patches, dim)
+            return current.reshape(bsz, num_views * num_patches, dim)
+
+        current = patches[:, :, -1]
+        if self.fusion_type == "delta_mlp":
+            previous = patches[:, :, -2]
+            delta = current - previous
+            x = torch.cat([current, delta], dim=-1)
+            current_delta = self.delta_fc2(self.delta_act(self.delta_fc1(self.delta_norm(x))))
+            current_delta = self.delta_gate.to(current_delta.dtype) * current_delta
+            if return_delta:
+                return current_delta.reshape(bsz, num_views * num_patches, dim)
+            fused = current + current_delta
+            return fused.reshape(bsz, num_views * num_patches, dim)
+
+        x = patches.permute(0, 1, 3, 2, 4).reshape(bsz * num_views * num_patches, num_frames, dim)
+        x = self.down_proj(self.attn_norm(x))
+        x = x + self._temporal_position_encoding(num_frames, x.shape[-1], x.device, x.dtype)
+        if self.use_current_query_attention:
+            attended, _ = self.temporal_attn(x[:, -1:], x, x, need_weights=False)
+            current_delta = self.up_proj(attended[:, 0])
+            current_delta = current_delta.reshape(bsz, num_views, num_patches, dim)
+            if return_delta:
+                return current_delta.reshape(bsz, num_views * num_patches, dim)
+            return (current + current_delta).reshape(bsz, num_views * num_patches, dim)
+
+        causal_mask = torch.triu(
+            torch.ones(num_frames, num_frames, device=x.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        attended, _ = self.temporal_attn(x, x, x, attn_mask=causal_mask, need_weights=False)
+        current_delta = self.up_proj(attended[:, -1])
+        current_delta = current_delta.reshape(bsz, num_views, num_patches, dim)
+        if return_delta:
+            return current_delta.reshape(bsz, num_views * num_patches, dim)
+        return (current + current_delta).reshape(bsz, num_views * num_patches, dim)
+
+    @staticmethod
+    def _temporal_position_encoding(
+        num_frames: int,
+        dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        positions = torch.arange(-(num_frames - 1), 1, device=device, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-np.log(10000.0) / max(dim, 1))
+        )
+        pe = torch.zeros(num_frames, dim, device=device, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(positions * div_term)
+        if dim > 1:
+            pe[:, 1::2] = torch.cos(positions * div_term[: pe[:, 1::2].shape[1]])
+        pe[-1] = 0.0
+        return pe.unsqueeze(0).to(dtype=dtype)
+
+
 class PrismaticVisionBackbone(nn.Module):
     """
     Vision backbone for Prismatic models that handles image feature extraction.
@@ -97,6 +206,8 @@ class PrismaticVisionBackbone(nn.Module):
         super().__init__()
         self.use_fused_vision_backbone = use_fused_vision_backbone
         self.num_images_in_input = 1  # Default value, can be overridden later
+        self.num_temporal_frames = 1  # Default value preserves legacy single-frame behavior
+        self.use_mid_layer_temporal_fusion = False
 
         # Validate number of (fused) vision backbones
         if len(timm_model_ids) > 2:
@@ -114,6 +225,7 @@ class PrismaticVisionBackbone(nn.Module):
                 model_id=timm_model_ids[1], img_size=image_sizes[1], act_layer=timm_override_act_layers[1]
             )
             self.embed_dim += self.fused_featurizer.embed_dim
+        self.temporal_patch_attention = CausalTemporalPatchAttention(self.embed_dim)
 
         # Patch LayerScale modules for HF compatibility
         self._patch_layer_scales()
@@ -195,6 +307,68 @@ class PrismaticVisionBackbone(nn.Module):
         self.num_images_in_input = num_images_in_input
 
 
+    def get_num_temporal_frames(self) -> int:
+        return self.num_temporal_frames
+
+
+    def set_num_temporal_frames(self, num_temporal_frames: int) -> None:
+        if num_temporal_frames < 1:
+            raise ValueError(f"num_temporal_frames must be >= 1, got {num_temporal_frames}.")
+        self.num_temporal_frames = num_temporal_frames
+
+
+    def get_temporal_fusion_type(self) -> str:
+        return self.temporal_patch_attention.fusion_type
+
+
+    def set_temporal_fusion_type(self, temporal_fusion_type: str) -> None:
+        self.temporal_patch_attention.set_fusion_type(temporal_fusion_type)
+
+
+    def get_use_current_query_attention(self) -> bool:
+        return self.temporal_patch_attention.use_current_query_attention
+
+
+    def set_use_current_query_attention(self, use_current_query_attention: bool) -> None:
+        self.temporal_patch_attention.set_use_current_query_attention(use_current_query_attention)
+
+
+    def get_use_mid_layer_temporal_fusion(self) -> bool:
+        return self.use_mid_layer_temporal_fusion
+
+
+    def set_use_mid_layer_temporal_fusion(self, use_mid_layer_temporal_fusion: bool) -> None:
+        self.use_mid_layer_temporal_fusion = bool(use_mid_layer_temporal_fusion)
+
+
+    @staticmethod
+    def _temporal_mid_layer_index(featurizer: nn.Module) -> int:
+        final_idx = max(0, len(featurizer.blocks) - 2)
+        return max(0, final_idx // 2)
+
+
+    def _forward_fused_image_middle_and_final(self, img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+        mid_idx = self._temporal_mid_layer_index(self.featurizer)
+        final_idx = max(0, len(self.featurizer.blocks) - 2)
+        fused_mid_idx = self._temporal_mid_layer_index(self.fused_featurizer)
+        fused_final_idx = max(0, len(self.fused_featurizer.blocks) - 2)
+        patches_mid, patches_final = self.featurizer.get_intermediate_layers(img_regular, n={mid_idx, final_idx})
+        patches_fused_mid, patches_fused_final = self.fused_featurizer.get_intermediate_layers(
+            img_fused, n={fused_mid_idx, fused_final_idx}
+        )
+        middle = torch.cat([patches_mid, patches_fused_mid], dim=2)
+        final = torch.cat([patches_final, patches_fused_final], dim=2)
+        return middle, final
+
+
+    def _forward_fused_image(self, img: torch.Tensor) -> torch.Tensor:
+        img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+        patches = self.featurizer(img_regular)
+        patches_fused = self.fused_featurizer(img_fused)
+        return torch.cat([patches, patches_fused], dim=2)
+
+
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone.
@@ -205,38 +379,54 @@ class PrismaticVisionBackbone(nn.Module):
         Args:
             pixel_values (torch.Tensor): Pixels for input image(s), (B, C, H, W).
         """
-        if self.num_images_in_input == 1:
+        if self.num_images_in_input == 1 and self.num_temporal_frames == 1:
             if not self.use_fused_vision_backbone:
                 return self.featurizer(pixel_values)
 
             # Split `pixel_values :: [bsz, 2 * 3, resolution, resolution]` =>> featurize =>> channel stack
-            img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
-            patches, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
-
-            return torch.cat([patches, patches_fused], dim=2)
+            return self._forward_fused_image(pixel_values)
 
         else:
-            assert self.use_fused_vision_backbone, "Multi-image inputs require using fused backbone!"
+            assert self.use_fused_vision_backbone, "Multi-image or multi-frame inputs require using fused backbone!"
 
             # Split `pixel_values` into individual images (each with 6 channels: 3 for SigLIP + 3 for DINOv2)
-            images = torch.split(pixel_values, [6] * self.num_images_in_input, dim=1)
+            expected_images = self.num_images_in_input * self.num_temporal_frames
+            expected_channels = 6 * expected_images
+            if pixel_values.shape[1] != expected_channels:
+                raise ValueError(
+                    f"Expected pixel_values with {expected_channels} channels "
+                    f"({self.num_images_in_input} view(s) * {self.num_temporal_frames} frame(s) * 6), "
+                    f"got {pixel_values.shape[1]}."
+                )
+            images = torch.split(pixel_values, [6] * expected_images, dim=1)
 
             # Process each image and collect patches
             all_patches = []
+            all_middle_patches = [] if self.use_mid_layer_temporal_fusion and self.num_temporal_frames > 1 else None
             for img in images:
-                # Split each image further into two stacks of channels (each with 3 channels)
-                img_regular, img_fused = torch.split(img, [3, 3], dim=1)
+                if all_middle_patches is None:
+                    all_patches.append(self._forward_fused_image(img))
+                else:
+                    middle_patches, final_patches = self._forward_fused_image_middle_and_final(img)
+                    all_middle_patches.append(middle_patches)
+                    all_patches.append(final_patches)
 
-                # Get patches from both SigLIP and DINOv2 vision transformers
-                patches = self.featurizer(img_regular)
-                patches_fused = self.fused_featurizer(img_fused)
+            if self.num_temporal_frames == 1:
+                return torch.cat(all_patches, dim=1)
 
-                # Concatenate SigLIP and DINOv2 patches along the hidden dimension
-                combined_patches = torch.cat([patches, patches_fused], dim=2)
-                all_patches.append(combined_patches)
-
-            # Concatenate all patches along the patch dimension
-            return torch.cat(all_patches, dim=1)
+            patch_stack = torch.stack(all_patches, dim=1)
+            bsz, _, num_patches, dim = patch_stack.shape
+            patch_stack = patch_stack.reshape(
+                bsz, self.num_images_in_input, self.num_temporal_frames, num_patches, dim
+            )
+            if all_middle_patches is not None:
+                middle_patch_stack = torch.stack(all_middle_patches, dim=1).reshape(
+                    bsz, self.num_images_in_input, self.num_temporal_frames, num_patches, dim
+                )
+                temporal_delta = self.temporal_patch_attention(middle_patch_stack, return_delta=True)
+                current_final = patch_stack[:, :, -1].reshape(bsz, self.num_images_in_input * num_patches, dim)
+                return current_final + temporal_delta
+            return self.temporal_patch_attention(patch_stack)
 
 
 

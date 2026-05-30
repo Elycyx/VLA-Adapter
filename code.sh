@@ -24,13 +24,17 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-no
 --run_root_dir outputs \
 --use_film False \
 --num_images_in_input 2 \
+--num_temporal_frames 2 \
+--temporal_fusion_type attention \
+--use_current_query_temporal_attention False \
+--use_mid_layer_temporal_fusion True \
 --use_proprio True \
 --use_lora True \
 --use_fz False \
 --use_minivlm True \
 --image_aug True \
 --num_steps_before_decay 100000 \
---max_steps 80005 \
+--max_steps 60005 \
 --save_freq 10000 \
 --save_latest_checkpoint_only False \
 --merge_lora_during_training True \
@@ -46,7 +50,7 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-no
 --pred_tokens_before_action False \
 --future_pred_feature_dir $dinov3_feature_dir \
 --future_pred_loss_weight 0.05 \
---run_id_note VLA-Adapter--pick_place_conveyor--pred--conf--$current_time \
+--run_id_note VLA-Adapter--pick_place_conveyor--pred--2frame--attn--mid_layer--$current_time \
 --use_relative_action false \
 --relative_action_mask true,true,true,true,true,true,true,false
 
@@ -69,7 +73,6 @@ python policy_server.py \
 python policy_server.py \
   --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred2----60000_chkpt \
   --use_future_pred \
-  --use_future_conf \
   --host 0.0.0.0 \
   --port 8000
 
@@ -95,6 +98,17 @@ python policy_server.py \
   --return_confidence \
   --confidence_threshold 0.8 \
   --min_action_horizon 1 --confidence-score-log ./logs/confidence_scores.jsonl
+
+
+python policy_server.py \
+  --pretrained_checkpoint outputs/configs+pick_place_conveyor+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--pick_place_conveyor--pred--2frame--attn--mid_layer----60000_chkpt \
+  --use_future_pred \
+  --num_temporal_frames 2 \
+  --temporal_fusion_type attention \
+  --use_mid_layer_temporal_fusion \
+  --host 0.0.0.0 \
+  --port 8000
+
 
 
 

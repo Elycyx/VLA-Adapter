@@ -42,20 +42,22 @@ class RLDSBatchTransform:
     future_pred_feature_dir: Optional[Path] = None
     load_future_pred_features: bool = True
     future_recon_size: Optional[Tuple[int, int]] = None
+    num_temporal_frames: int = 1
 
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        current_idx = max(0, self.num_temporal_frames - 1)
+        dataset_name = rlds_batch["dataset_name"]
+        actions = rlds_batch["action"][current_idx:]
+        current_action = actions[0]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
-        actions = rlds_batch["action"]
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
         # Get future action chunk
-        future_actions = rlds_batch["action"][1:]
+        future_actions = actions[1:]
 
         if self.use_minivlm:
             self.prompt_builder_fn = QwenPromptBuilder
@@ -153,7 +155,7 @@ class RLDSBatchTransform:
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-        pixel_values = self.image_transform(img)
+        pixel_values = self._temporal_images_to_pixels(rlds_batch["observation"]["image_primary"])
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
@@ -204,15 +206,22 @@ class RLDSBatchTransform:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
-                    img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
-                    pixel_values_wrist = self.image_transform(img_wrist)
+                    pixel_values_wrist = self._temporal_images_to_pixels(rlds_batch["observation"][k])
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
-            proprio = rlds_batch["observation"]["proprio"]
+            proprio = rlds_batch["observation"]["proprio"][current_idx]
             return_dict["proprio"] = proprio
 
         return return_dict
+
+    def _temporal_images_to_pixels(self, images: np.ndarray) -> torch.Tensor:
+        """Transform a temporal window of RGB images into view-local channel stacks."""
+        frames = []
+        for frame_idx in range(self.num_temporal_frames):
+            img = Image.fromarray(images[frame_idx])
+            frames.append(self.image_transform(img))
+        return torch.cat(frames, dim=0)
 
     def _future_images_to_rgb_tensor(self, future_imgs: np.ndarray) -> torch.Tensor:
         """Convert future uint8 RGB frames to (chunk, 3, H, W) float tensors in [0, 1]."""
@@ -241,8 +250,11 @@ class RLDSDataset(IterableDataset):
         use_relative_action: bool = False,
         relative_action_mask: Optional[Tuple[bool, ...]] = None,
         use_future_pred: bool = False,
+        num_temporal_frames: int = 1,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
+        if num_temporal_frames < 1:
+            raise ValueError(f"num_temporal_frames must be >= 1, got {num_temporal_frames}.")
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
 
         # Configure RLDS Dataset(s)
@@ -273,7 +285,7 @@ class RLDSDataset(IterableDataset):
 
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=1,                                      # If we wanted to feed / predict more than one step
+                window_size=num_temporal_frames,                    # Past frames + current frame for short-term memory
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 future_obs_window_size=NUM_ACTIONS_CHUNK if use_future_pred else 0,
                 skip_unlabeled=True,                                # Skip trajectories without language labels

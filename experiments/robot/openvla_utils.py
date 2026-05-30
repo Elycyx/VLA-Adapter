@@ -323,6 +323,35 @@ def get_vla(cfg: Any) -> torch.nn.Module:
 
     # Set number of images in model input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    if hasattr(vla.vision_backbone, "set_num_temporal_frames"):
+        vla.vision_backbone.set_num_temporal_frames(getattr(cfg, "num_temporal_frames", 1))
+    if hasattr(vla.vision_backbone, "set_temporal_fusion_type"):
+        vla.vision_backbone.set_temporal_fusion_type(getattr(cfg, "temporal_fusion_type", "attention"))
+    if hasattr(vla.vision_backbone, "set_use_current_query_attention"):
+        vla.vision_backbone.set_use_current_query_attention(
+            getattr(cfg, "use_current_query_temporal_attention", False)
+        )
+    if hasattr(vla.vision_backbone, "set_use_mid_layer_temporal_fusion"):
+        vla.vision_backbone.set_use_mid_layer_temporal_fusion(
+            getattr(cfg, "use_mid_layer_temporal_fusion", False)
+        )
+    if getattr(cfg, "num_temporal_frames", 1) > 1:
+        try:
+            temporal_ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "temporal_patch_attention")
+        except AssertionError:
+            temporal_ckpt_path = None
+        if temporal_ckpt_path is not None and hasattr(vla.vision_backbone, "temporal_patch_attention"):
+            print(f"[openvla_utils] loading temporal_patch_attention from {temporal_ckpt_path}", flush=True)
+            temporal_state = load_component_state_dict(temporal_ckpt_path)
+            try:
+                vla.vision_backbone.temporal_patch_attention.load_state_dict(temporal_state)
+            except RuntimeError as exc:
+                print(
+                    "[openvla_utils] WARNING: failed to load temporal_patch_attention checkpoint. "
+                    "This usually means the checkpoint was trained with an older temporal fusion architecture. "
+                    f"Details: {exc}",
+                    flush=True,
+                )
 
     vla.eval()
 
@@ -802,6 +831,44 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def _temporal_frames(image_or_frames: Any, num_temporal_frames: int) -> List[np.ndarray]:
+    if isinstance(image_or_frames, (list, tuple)):
+        frames = list(image_or_frames)
+    else:
+        frames = [image_or_frames]
+    if not frames:
+        raise ValueError("Temporal image input must contain at least one frame.")
+    frames = frames[-num_temporal_frames:]
+    if len(frames) < num_temporal_frames:
+        frames = [frames[0]] * (num_temporal_frames - len(frames)) + frames
+    return frames
+
+
+def _build_temporal_pixel_values(
+    cfg: Any,
+    processor: Any,
+    prompt: str,
+    view_images: List[Any],
+) -> Tuple[Dict[str, torch.Tensor], List[Image.Image]]:
+    num_temporal_frames = int(getattr(cfg, "num_temporal_frames", 1))
+    view_frame_pixels = []
+    prepared_images = []
+
+    for view in view_images:
+        frames = _temporal_frames(view, num_temporal_frames)
+        prepared_frames = prepare_images_for_vla(frames, cfg)
+        prepared_images.extend(prepared_frames)
+        view_frame_pixels.extend(
+            processor(prompt, frame).to(DEVICE, dtype=torch.bfloat16)["pixel_values"]
+            for frame in prepared_frames
+        )
+
+    # Tokenize once with the current primary frame; pixel_values are replaced by the temporal stack below.
+    inputs = processor(prompt, prepared_images[num_temporal_frames - 1]).to(DEVICE, dtype=torch.bfloat16)
+    inputs["pixel_values"] = torch.cat(view_frame_pixels, dim=1)
+    return inputs, prepared_images
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -833,16 +900,10 @@ def get_vla_action(
     """
     with torch.inference_mode():
 
-        # Collect all input images
+        # Collect all input images. Each value may be a single frame or an old-to-current frame list.
         all_images = [obs["full_image"]]
         if cfg.num_images_in_input > 1:
             all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
-
-        # Process images
-        all_images = prepare_images_for_vla(all_images, cfg)
-
-        # Extract primary image and additional images
-        primary_image = all_images.pop(0)
 
         # Build VLA prompt
         if not use_minivlm:
@@ -850,18 +911,8 @@ def get_vla_action(
         else:
             prompt = f'<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat action should the robot take to {task_label.lower()}?<|im_end|>\n<|im_start|>assistant\n'
 
-        # Process primary image
-        inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
-
-        # Process additional wrist images if any
-        if all_images:
-            all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
-            ]
-            # Concatenate all images
-            primary_pixel_values = inputs["pixel_values"]
-            all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
-            inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
+        # Process all views and temporal frames in view-major order: view0[t0..tN], view1[t0..tN], ...
+        inputs, _ = _build_temporal_pixel_values(cfg, processor, prompt, all_images)
 
         # Process proprioception data if used
         proprio = None
