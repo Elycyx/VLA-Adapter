@@ -77,12 +77,17 @@ class ServerConfig:
     pred_tokens_before_action: bool = False
     use_future_conf: bool = False
     future_confidence_gamma: float = 1.0
+    use_latency_conditioning: bool = False
+    latency_steps: int = 1
+    latency_steps_max: int = 5
     use_relative_action: bool = False
     relative_action_mask: str | tuple[bool, ...] | list[bool] | None = None
     center_crop: bool = False
     load_in_8bit: bool = False
     load_in_4bit: bool = False
     compile: bool = False
+    use_cuda_graph: bool = False
+    cuda_graph_warmup: int = 3
     debug: bool = False
     save_model_images: str | None = None
     return_confidence: bool = False
@@ -151,6 +156,166 @@ def _confidence_log_record(
     }
 
 
+class CUDAGraphActionRunner:
+    """Replay the fixed-shape GPU action path with CUDA Graph.
+
+    CPU preprocessing stays outside the graph. Captured graph covers VLM/action-head
+    forward plus action unnormalization into a static output buffer.
+    """
+
+    _INPUT_KEYS = ("input_ids", "attention_mask", "pixel_values")
+
+    def __init__(
+        self,
+        *,
+        policy: "VLAAdapterPolicy",
+        predict_kwargs: dict[str, Any],
+        warmup: int,
+    ) -> None:
+        if policy.device.type != "cuda":
+            raise ValueError("CUDA Graph requires a CUDA device.")
+        self.policy = policy
+        self.device = policy.device
+        self.warmup = max(1, int(warmup))
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_kwargs: dict[str, Any] = {}
+        self.static_inputs: dict[str, torch.Tensor] = {}
+        self.signature = self._signature(predict_kwargs)
+        self._validate_graph_inputs(predict_kwargs)
+        self._init_static_kwargs(predict_kwargs)
+        self._init_action_stats()
+        self.static_output: torch.Tensor | None = None
+        self._capture()
+
+    @staticmethod
+    def _tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
+        return (tuple(value.shape), str(value.dtype), str(value.device))
+
+    def _signature(self, predict_kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        parts: list[Any] = []
+        for key in self._INPUT_KEYS:
+            value = predict_kwargs[key]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"CUDA Graph input {key!r} must be a tensor.")
+            parts.append((key, self._tensor_signature(value)))
+        proprio = predict_kwargs.get("proprio")
+        if proprio is None:
+            parts.append(("proprio", None))
+        else:
+            proprio_tensor = torch.as_tensor(proprio)
+            parts.append(("proprio", tuple(proprio_tensor.shape)))
+        parts.append(("use_film", bool(predict_kwargs.get("use_film", False))))
+        parts.append(("latency_steps", self._latency_signature(predict_kwargs.get("latency_steps"))))
+        return tuple(parts)
+
+    @staticmethod
+    def _latency_signature(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return tuple(value.shape)
+        if isinstance(value, (list, tuple)):
+            return (len(value),)
+        return ()
+
+    def matches(self, predict_kwargs: dict[str, Any]) -> bool:
+        return self.signature == self._signature(predict_kwargs)
+
+    def _validate_graph_inputs(self, predict_kwargs: dict[str, Any]) -> None:
+        attention_mask = predict_kwargs["attention_mask"]
+        if not bool(torch.all(attention_mask == 1).item()):
+            raise ValueError(
+                "--use_cuda_graph currently requires an all-ones attention_mask "
+                "(no padded prompts within the captured batch)."
+            )
+
+    def _clone_static_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        return value.detach().clone().to(self.device)
+
+    def _init_static_kwargs(self, predict_kwargs: dict[str, Any]) -> None:
+        for key, value in predict_kwargs.items():
+            if key in self._INPUT_KEYS:
+                static = self._clone_static_tensor(value)
+                self.static_inputs[key] = static
+                self.static_kwargs[key] = static
+            elif key == "proprio" and value is not None:
+                static = torch.as_tensor(value, device=self.device, dtype=torch.bfloat16).detach().clone()
+                self.static_inputs[key] = static
+                self.static_kwargs[key] = static
+            elif key == "latency_steps" and value is not None:
+                static = torch.as_tensor(value, device=self.device, dtype=torch.bfloat16).detach().clone()
+                self.static_inputs[key] = static
+                self.static_kwargs[key] = static
+            else:
+                self.static_kwargs[key] = value
+        self.static_kwargs["return_normalized_tensor"] = True
+
+    def _init_action_stats(self) -> None:
+        stats = self.policy.model.get_action_stats(self.policy.unnorm_key)
+        if "q01" in stats and "q99" in stats:
+            low = np.asarray(stats["q01"], dtype=np.float32)
+            high = np.asarray(stats["q99"], dtype=np.float32)
+        else:
+            low = np.asarray(stats["min"], dtype=np.float32)
+            high = np.asarray(stats["max"], dtype=np.float32)
+        mask = np.asarray(stats.get("mask", np.ones_like(low, dtype=bool)), dtype=bool)
+        self.action_low = torch.as_tensor(low, device=self.device, dtype=torch.float32).view(1, 1, -1)
+        self.action_high = torch.as_tensor(high, device=self.device, dtype=torch.float32).view(1, 1, -1)
+        self.action_mask = torch.as_tensor(mask, device=self.device, dtype=torch.bool).view(1, 1, -1)
+
+    def _unnormalize_tensor(self, normalized_actions: torch.Tensor) -> torch.Tensor:
+        normalized_actions = normalized_actions.float()
+        unnormalized = 0.5 * (normalized_actions + 1.0) * (self.action_high - self.action_low + 1e-8) + self.action_low
+        return torch.where(self.action_mask, unnormalized, normalized_actions)
+
+    def _run_static_model(self) -> torch.Tensor:
+        normalized_actions, _ = self.policy.model.predict_action(**self.static_kwargs)
+        return self._unnormalize_tensor(normalized_actions)
+
+    def _capture(self) -> None:
+        torch.cuda.synchronize(self.device)
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(warmup_stream):
+            with torch.inference_mode():
+                for _ in range(self.warmup):
+                    actions = self._run_static_model()
+                self.static_output = torch.empty_like(actions)
+        torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
+        torch.cuda.synchronize(self.device)
+
+        if self.static_output is None:
+            raise RuntimeError("Failed to initialize CUDA Graph output buffer.")
+
+        with torch.cuda.graph(self.graph):
+            with torch.inference_mode():
+                actions = self._run_static_model()
+                self.static_output.copy_(actions)
+
+    def _copy_inputs(self, predict_kwargs: dict[str, Any]) -> None:
+        for key in self._INPUT_KEYS:
+            self.static_inputs[key].copy_(predict_kwargs[key])
+        if "proprio" in self.static_inputs:
+            self.static_inputs["proprio"].copy_(
+                torch.as_tensor(predict_kwargs["proprio"], device=self.device, dtype=self.static_inputs["proprio"].dtype)
+            )
+        if "latency_steps" in self.static_inputs:
+            self.static_inputs["latency_steps"].copy_(
+                torch.as_tensor(
+                    predict_kwargs["latency_steps"],
+                    device=self.device,
+                    dtype=self.static_inputs["latency_steps"].dtype,
+                )
+            )
+
+    def replay(self, predict_kwargs: dict[str, Any]) -> np.ndarray:
+        self._copy_inputs(predict_kwargs)
+        self.graph.replay()
+        if self.static_output is None:
+            raise RuntimeError("CUDA Graph output buffer is not initialized.")
+        return self.static_output.detach().cpu().numpy()
+
+
 class VLAAdapterPolicy:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
@@ -160,7 +325,12 @@ class VLAAdapterPolicy:
             raise ValueError("--use_relative_action requires --relative_action_mask.")
         if cfg.num_temporal_frames < 1:
             raise ValueError("--num_temporal_frames must be >= 1.")
+        if cfg.use_latency_conditioning and (cfg.latency_steps < 0 or cfg.latency_steps_max < 1):
+            raise ValueError("--use_latency_conditioning requires latency_steps >= 0 and latency_steps_max >= 1.")
+        if cfg.use_cuda_graph and not torch.cuda.is_available():
+            raise ValueError("--use_cuda_graph requires CUDA.")
         self.device = torch.device(cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+        self.cuda_graph_runner: CUDAGraphActionRunner | None = None
 
         # Import after parsing robot_platform so prismatic.vla.constants chooses
         # the same dimensions used by the checkpoint.
@@ -172,6 +342,7 @@ class VLAAdapterPolicy:
         from experiments.robot.openvla_utils import (
             absolute_actions_from_relative,
             get_action_head,
+            get_latency_projector,
             get_noisy_action_projector,
             get_processor,
             get_proprio_projector,
@@ -196,6 +367,11 @@ class VLAAdapterPolicy:
         if cfg.use_proprio:
             _status("loading proprio projector")
             self.proprio_projector = get_proprio_projector(cfg, self.model.llm_dim, proprio_dim=cfg.proprio_dim)
+
+        self.latency_projector = None
+        if cfg.use_latency_conditioning:
+            _status("loading latency projector")
+            self.latency_projector = get_latency_projector(cfg, self.model.llm_dim)
 
         if cfg.use_future_pred:
             _status("loading future-prediction components and enabling future-pred branch")
@@ -260,6 +436,8 @@ class VLAAdapterPolicy:
             self.noisy_action_projector = get_noisy_action_projector(cfg, self.model.llm_dim)
 
         if cfg.compile:
+            if cfg.use_cuda_graph:
+                raise ValueError("--compile and --use_cuda_graph should not be enabled together.")
             _status("compiling VLA model with torch.compile")
             self.model = torch.compile(self.model, mode="reduce-overhead")
 
@@ -303,6 +481,7 @@ class VLAAdapterPolicy:
             "temporal_fusion_type": self.cfg.temporal_fusion_type,
             "use_current_query_temporal_attention": self.cfg.use_current_query_temporal_attention,
             "use_mid_layer_temporal_fusion": self.cfg.use_mid_layer_temporal_fusion,
+            "use_cuda_graph": self.cfg.use_cuda_graph,
             "use_relative_action": self.cfg.use_relative_action,
             "relative_action_mask": self.cfg.relative_action_mask,
             "use_future_pred": self.cfg.use_future_pred,
@@ -351,6 +530,7 @@ class VLAAdapterPolicy:
 
         if self.cfg.debug:
             logger.info("env %s: running VLA inference", env_idx)
+        latency_steps = _resolve_latency_steps(request, self.cfg, env_idx)
         actions = self._get_vla_action(
             cfg=self.cfg,
             vla=self.model,
@@ -359,6 +539,8 @@ class VLAAdapterPolicy:
             task_label=str(task_description),
             action_head=self.action_head,
             proprio_projector=self.proprio_projector,
+            latency_projector=self.latency_projector,
+            latency_steps=latency_steps,
             noisy_action_projector=self.noisy_action_projector,
             use_film=self.cfg.use_film,
             use_minivlm=self.cfg.use_minivlm,
@@ -454,18 +636,35 @@ class VLAAdapterPolicy:
                     None if proprio is None else proprio.shape,
                 )
 
+            latency_steps = _resolve_latency_steps(request, self.cfg)
             predict_kwargs = dict(
                 **inputs,
                 unnorm_key=self.cfg.unnorm_key,
                 do_sample=False,
                 proprio=proprio,
                 proprio_projector=self.proprio_projector,
+                latency_steps=latency_steps,
+                latency_projector=self.latency_projector,
+                latency_steps_scale=self.cfg.latency_steps_max,
                 noisy_action_projector=self.noisy_action_projector,
                 action_head=self.action_head,
                 use_film=self.cfg.use_film,
             )
             confidence_info = None
-            if self.cfg.return_confidence:
+            if self.cfg.use_cuda_graph:
+                if self.cfg.return_confidence:
+                    raise ValueError("--use_cuda_graph does not support --return_confidence.")
+                if self.action_head is None:
+                    raise ValueError("--use_cuda_graph currently requires an action head.")
+                if self.cuda_graph_runner is None or not self.cuda_graph_runner.matches(predict_kwargs):
+                    _status("capturing CUDA Graph for fixed-shape action inference")
+                    self.cuda_graph_runner = CUDAGraphActionRunner(
+                        policy=self,
+                        predict_kwargs=predict_kwargs,
+                        warmup=self.cfg.cuda_graph_warmup,
+                    )
+                actions = self.cuda_graph_runner.replay(predict_kwargs)
+            elif self.cfg.return_confidence:
                 actions, _, confidence_info = self.model.predict_action(
                     **predict_kwargs,
                     return_pred_confidence=True,
@@ -687,6 +886,26 @@ def _build_proprio_state(request: dict[str, Any], env_idx: int) -> np.ndarray:
     raise ValueError("Missing proprioception. Expected state, joint_positions, or eef_pos/eef_orient.")
 
 
+def _resolve_latency_steps(request: dict[str, Any], cfg: ServerConfig, env_idx: int | None = None) -> int | list[int] | None:
+    if not cfg.use_latency_conditioning:
+        return None
+
+    raw_steps = request.get("latency_steps", cfg.latency_steps)
+    if env_idx is not None and isinstance(raw_steps, (list, tuple)):
+        raw_steps = raw_steps[env_idx]
+
+    if env_idx is None and isinstance(raw_steps, (list, tuple)):
+        values = [int(round(float(value))) for value in raw_steps]
+        if any(value < 0 for value in values):
+            raise ValueError("latency_steps must be non-negative.")
+        return values
+
+    value = int(round(float(raw_steps)))
+    if value < 0:
+        raise ValueError("latency_steps must be non-negative.")
+    return value
+
+
 def _ensure_action_chunk(actions: np.ndarray, horizon: int, action_dim: int) -> np.ndarray:
     if actions.ndim == 3:
         if actions.shape[0] != 1:
@@ -819,6 +1038,8 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
 
     actions_payload = stacked.tolist() if isinstance(stacked, np.ndarray) else stacked
     out = {"actions": actions_payload, "latency_s": round(time.monotonic() - t0, 4)}
+    if CONFIG.use_latency_conditioning:
+        out["latency_steps"] = _resolve_latency_steps(request, CONFIG)
     if confidence_info is not None:
         out.update(confidence_info)
 
@@ -899,6 +1120,9 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--use_minivlm", action=argparse.BooleanOptionalAction, default=CONFIG.use_minivlm)
     parser.add_argument("--use_pro_version", action=argparse.BooleanOptionalAction, default=CONFIG.use_pro_version)
     parser.add_argument("--use_future_pred", action=argparse.BooleanOptionalAction, default=CONFIG.use_future_pred)
+    parser.add_argument("--use_latency_conditioning", action=argparse.BooleanOptionalAction, default=CONFIG.use_latency_conditioning)
+    parser.add_argument("--latency_steps", type=int, default=CONFIG.latency_steps)
+    parser.add_argument("--latency_steps_max", type=int, default=CONFIG.latency_steps_max)
     parser.add_argument(
         "--use_future_conf",
         action=argparse.BooleanOptionalAction,
@@ -920,6 +1144,8 @@ def parse_args() -> ServerConfig:
     parser.add_argument("--load_in_8bit", action=argparse.BooleanOptionalAction, default=CONFIG.load_in_8bit)
     parser.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=CONFIG.load_in_4bit)
     parser.add_argument("--compile", action="store_true", default=CONFIG.compile)
+    parser.add_argument("--use_cuda_graph", action=argparse.BooleanOptionalAction, default=CONFIG.use_cuda_graph)
+    parser.add_argument("--cuda_graph_warmup", type=int, default=CONFIG.cuda_graph_warmup)
     parser.add_argument("--debug", action="store_true", default=CONFIG.debug)
     parser.add_argument("--save-model-images", dest="save_model_images", default=CONFIG.save_model_images, metavar="DIR")
     parser.add_argument("--return_confidence", action=argparse.BooleanOptionalAction, default=CONFIG.return_confidence)

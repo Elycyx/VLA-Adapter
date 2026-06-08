@@ -4,9 +4,9 @@ action_heads.py
 Implementations of various action heads, which serve as alternatives to VLM sequential token prediction.
 """
 
-import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX, NUM_TOKENS
 
 
@@ -45,14 +45,30 @@ class L1RegressionActionHead(nn.Module):
             actions_hidden_states, 
             proprio=None, 
             proprio_projector=None,
+            latency_steps=None,
+            latency_projector=None,
+            latency_steps_scale=1.0,
             phase="Inference"
             ):
         batch_size = actions_hidden_states.shape[0]
         device = actions_hidden_states.device
 
-        proprio = proprio.reshape(batch_size, -1).to(torch.bfloat16)  # (bsz, proprio_dim)
-        proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
-        proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
+        conditioning_features = []
+        if proprio is not None and proprio_projector is not None:
+            proprio = proprio.reshape(batch_size, -1).to(torch.bfloat16)  # (bsz, proprio_dim)
+            proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
+            conditioning_features.append(proprio_features.unsqueeze(dim=1))  # (bsz, 1, llm_dim)
+        if latency_steps is not None and latency_projector is not None:
+            if not isinstance(latency_steps, torch.Tensor):
+                latency_steps = torch.as_tensor(latency_steps)
+            latency_steps = latency_steps.to(device=device, dtype=torch.bfloat16)
+            if latency_steps.numel() == 1 and batch_size > 1:
+                latency_steps = latency_steps.expand(batch_size)
+            latency_steps = latency_steps.reshape(batch_size, -1)
+            latency_steps = latency_steps / max(float(latency_steps_scale), 1.0)
+            latency_features = latency_projector(latency_steps)  # (bsz, llm_dim)
+            conditioning_features.append(latency_features.unsqueeze(dim=1))  # (bsz, 1, llm_dim)
+        extra_features = torch.cat(conditioning_features, dim=1) if conditioning_features else None
 
         task_hidden_states = actions_hidden_states[:, :, :self.num_task_tokens, :]
         actions_hidden_states = actions_hidden_states[:, :, self.num_task_tokens:, :]
@@ -74,7 +90,7 @@ class L1RegressionActionHead(nn.Module):
         action = self.model(
             rearranged_actions_hidden_states,
             h_a=actions_hidden_states,
-            p=proprio_features,
+            p=extra_features,
             h_t=task_hidden_states
             )
 
@@ -264,16 +280,9 @@ class MLPResNetBlock(nn.Module):
         k_adapter = k_adapter.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
         v_adapter = v_adapter.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attn_scores_tokens = torch.matmul(q_1, k_tokens.transpose(-2, -1)) # (B, H, T, T)
-        attn_scores_task = torch.matmul(q_1, k_task.transpose(-2, -1)) * 1 # (B, H, T, K)
-        attn_scores_adapter = torch.matmul(q_1, k_adapter.transpose(-2, -1)) * ratio_g # (B, H, T, K)
-
-        attn_scores = torch.cat([attn_scores_tokens, attn_scores_task, attn_scores_adapter], dim=-1) # (B, H, T, T+K)
-        attn_scores = attn_scores / math.sqrt(self.head_dim)
-        attn_weights = torch.softmax(attn_scores, dim=-1) # (B, H, T, T+K)
-
+        k_combined = torch.cat([k_tokens, k_task, ratio_g * k_adapter], dim=2)
         v_combined = torch.cat([v_tokens, v_task, v_adapter], dim=2) # (B, H, T+K, head_dim)
-        output = torch.matmul(attn_weights, v_combined) # (B, H, T, head_dim)
+        output = F.scaled_dot_product_attention(q_1, k_combined, v_combined, dropout_p=0.0)
 
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(output)
@@ -343,12 +352,12 @@ class MLPResNetBlock_Pro(nn.Module):
         g = self.gating_factor
         ratio_g = torch.tanh(g)
 
-        # concat h_a and p
-        h_adapter = torch.cat((h_a, p),dim=1)
+        adapter_tokens = [token for token in (h_a, p) if token is not None]
+        h_adapter = torch.cat(adapter_tokens, dim=1)
 
         h_task = h_t
         B, T, C = x.shape
-        K_a = h_adapter.size(1) if h_a is not None else 0
+        K_a = h_adapter.size(1)
         K_t = h_task.size(1) if h_task is not None else 0
 
         # Q
@@ -385,18 +394,11 @@ class MLPResNetBlock_Pro(nn.Module):
         cos_t, sin_t = self.rope(seq_len=K_t, device=x.device, dtype=x.dtype)
         _, k_task = apply_rope(k_task, k_task, cos_t, sin_t)
 
-        # attention scores
-        attn_scores = [torch.matmul(q_1, k_tokens.transpose(-2, -1))]
-        attn_scores.append(torch.matmul(q_1, k_adapter.transpose(-2, -1)))
-        attn_scores.append(torch.matmul(q_1, k_task.transpose(-2, -1)) * ratio_g)
-        attn_scores = torch.cat(attn_scores, dim=-1) / math.sqrt(self.head_dim)
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-
-        # combine V
+        # combine K/V and use fused SDPA instead of explicit matmul + cat + softmax + matmul
+        k_combined = torch.cat([k_tokens, k_adapter, ratio_g * k_task], dim=2)
         v_list = [v_tokens,v_adapter,v_task]
         v_combined = torch.cat(v_list, dim=2)
-
-        output = torch.matmul(attn_weights, v_combined)
+        output = F.scaled_dot_product_attention(q_1, k_combined, v_combined, dropout_p=0.0)
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(output)
 

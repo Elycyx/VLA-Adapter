@@ -172,6 +172,13 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if "latency_steps" in instances[0]:
+            output["latency_steps"] = torch.tensor(
+                [float(instance["latency_steps"]) for instance in instances],
+                dtype=torch.float32,
+            )
+        if "action_pad_mask" in instances[0]:
+            output["action_pad_mask"] = torch.stack([instance["action_pad_mask"] for instance in instances])
 
         # Future-vision prediction extras (optional). All instances either provide them or none do.
         if "pred_mask" in instances[0]:

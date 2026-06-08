@@ -162,3 +162,4 @@ pretrained_models/configs/modeling_prismatic.py.back*
 
 logs/
 runs/
+temporal_stride_vis/

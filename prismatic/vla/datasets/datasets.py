@@ -43,13 +43,24 @@ class RLDSBatchTransform:
     load_future_pred_features: bool = True
     future_recon_size: Optional[Tuple[int, int]] = None
     num_temporal_frames: int = 1
+    temporal_frame_interval: int = 1
+    use_latency_conditioning: bool = False
+    latency_steps_min: int = 1
+    latency_steps_max: int = 5
 
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        current_idx = max(0, self.num_temporal_frames - 1)
+        current_idx = max(0, (self.num_temporal_frames - 1) * self.temporal_frame_interval)
         dataset_name = rlds_batch["dataset_name"]
-        actions = rlds_batch["action"][current_idx:]
+        latency_steps = self._sample_latency_steps()
+        action_start_idx = current_idx + latency_steps
+        action_end_idx = action_start_idx + NUM_ACTIONS_CHUNK
+        actions = rlds_batch["action"][action_start_idx:action_end_idx]
+        action_pad_mask = np.asarray(
+            rlds_batch["pad_mask_future_actions"][action_start_idx:action_end_idx],
+            dtype=np.bool_,
+        )
         current_action = actions[0]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
@@ -163,6 +174,9 @@ class RLDSBatchTransform:
             labels[-1] = IGNORE_INDEX
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        if self.use_latency_conditioning:
+            return_dict["latency_steps"] = np.asarray(latency_steps, dtype=np.float32)
+            return_dict["action_pad_mask"] = torch.from_numpy(action_pad_mask.copy())
 
         # Future-vision prediction extras
         if self.use_future_pred:
@@ -182,6 +196,7 @@ class RLDSBatchTransform:
             # Force pred-position labels to IGNORE_INDEX (in case the trailing slice above missed any).
             labels[pred_start : pred_start + NUM_PRED_TOKENS] = IGNORE_INDEX
 
+            # Future prediction remains anchored at the observation time t; latency only shifts action targets.
             future_imgs = rlds_batch["image_primary_future"]  # (chunk, H, W, 3) uint8
             future_pad_mask = torch.from_numpy(
                 np.asarray(rlds_batch["pad_mask_future_obs"], dtype=np.bool_).copy()
@@ -215,10 +230,25 @@ class RLDSBatchTransform:
 
         return return_dict
 
+    def _sample_latency_steps(self) -> int:
+        """Sample synthetic inference delay in control steps."""
+        if not self.use_latency_conditioning:
+            return 0
+        latency_min = int(self.latency_steps_min)
+        latency_max = int(self.latency_steps_max)
+        if latency_min < 0 or latency_max < latency_min:
+            raise ValueError(
+                f"Invalid latency range [{latency_min}, {latency_max}]. "
+                "Expected 0 <= latency_steps_min <= latency_steps_max."
+            )
+        return random.randint(latency_min, latency_max)
+
     def _temporal_images_to_pixels(self, images: np.ndarray) -> torch.Tensor:
         """Transform a temporal window of RGB images into view-local channel stacks."""
         frames = []
-        for frame_idx in range(self.num_temporal_frames):
+        start_idx = max(0, images.shape[0] - 1 - (self.num_temporal_frames - 1) * self.temporal_frame_interval)
+        frame_indices = [start_idx + i * self.temporal_frame_interval for i in range(self.num_temporal_frames)]
+        for frame_idx in frame_indices:
             img = Image.fromarray(images[frame_idx])
             frames.append(self.image_transform(img))
         return torch.cat(frames, dim=0)
@@ -251,11 +281,30 @@ class RLDSDataset(IterableDataset):
         relative_action_mask: Optional[Tuple[bool, ...]] = None,
         use_future_pred: bool = False,
         num_temporal_frames: int = 1,
+        temporal_frame_interval: int = 1,
+        use_latency_conditioning: bool = False,
+        latency_steps_min: int = 1,
+        latency_steps_max: int = 5,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         if num_temporal_frames < 1:
             raise ValueError(f"num_temporal_frames must be >= 1, got {num_temporal_frames}.")
+        if temporal_frame_interval < 1:
+            raise ValueError(f"temporal_frame_interval must be >= 1, got {temporal_frame_interval}.")
+        temporal_window_size = (num_temporal_frames - 1) * temporal_frame_interval + 1
+        latency_steps_max = int(latency_steps_max) if use_latency_conditioning else 0
+        latency_steps_min = int(latency_steps_min) if use_latency_conditioning else 0
+        if latency_steps_min < 0 or latency_steps_max < latency_steps_min:
+            raise ValueError(
+                f"Invalid latency range [{latency_steps_min}, {latency_steps_max}]. "
+                "Expected 0 <= latency_steps_min <= latency_steps_max."
+            )
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
+        self.batch_transform.num_temporal_frames = num_temporal_frames
+        self.batch_transform.temporal_frame_interval = temporal_frame_interval
+        self.batch_transform.use_latency_conditioning = use_latency_conditioning
+        self.batch_transform.latency_steps_min = latency_steps_min
+        self.batch_transform.latency_steps_max = latency_steps_max
 
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
@@ -285,8 +334,8 @@ class RLDSDataset(IterableDataset):
 
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=num_temporal_frames,                    # Past frames + current frame for short-term memory
-                future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
+                window_size=temporal_window_size,                   # Full history window before interval sampling
+                future_action_window_size=NUM_ACTIONS_CHUNK - 1 + latency_steps_max,  # For delayed action chunking
                 future_obs_window_size=NUM_ACTIONS_CHUNK if use_future_pred else 0,
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused

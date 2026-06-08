@@ -26,7 +26,7 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
-from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.models.projectors import LatencyProjector, NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -494,6 +494,23 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
     return proprio_projector
 
 
+def get_latency_projector(cfg: Any, llm_dim: int) -> LatencyProjector:
+    """
+    Get inference-latency projector for delayed action prediction.
+    """
+    latency_projector = LatencyProjector(llm_dim=llm_dim).to(DEVICE)
+    latency_projector = latency_projector.to(torch.bfloat16).to(DEVICE)
+    latency_projector.eval()
+
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+        raise ValueError("Latency-conditioned HF Hub checkpoints are not registered in openvla_utils.py yet.")
+
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "latency_projector")
+    state_dict = load_component_state_dict(checkpoint_path)
+    latency_projector.load_state_dict(state_dict)
+    return latency_projector
+
+
 def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     """
     Get noisy action projector for diffusion-based action prediction.
@@ -877,6 +894,8 @@ def get_vla_action(
     task_label: str,
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
+    latency_projector: Optional[torch.nn.Module] = None,
+    latency_steps: Optional[Union[int, float, np.ndarray, torch.Tensor]] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
     use_minivlm: bool = False,
@@ -949,6 +968,9 @@ def get_vla_action(
                 do_sample=False,
                 proprio=proprio,
                 proprio_projector=proprio_projector,
+                latency_steps=latency_steps,
+                latency_projector=latency_projector,
+                latency_steps_scale=getattr(cfg, "latency_steps_max", getattr(cfg, "latency_steps", 1)),
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,

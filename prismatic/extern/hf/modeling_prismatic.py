@@ -400,27 +400,30 @@ class PrismaticVisionBackbone(nn.Module):
                 )
             images = torch.split(pixel_values, [6] * expected_images, dim=1)
 
-            # Process each image and collect patches
-            all_patches = []
-            all_middle_patches = [] if self.use_mid_layer_temporal_fusion and self.num_temporal_frames > 1 else None
-            for img in images:
-                if all_middle_patches is None:
-                    all_patches.append(self._forward_fused_image(img))
-                else:
-                    middle_patches, final_patches = self._forward_fused_image_middle_and_final(img)
-                    all_middle_patches.append(middle_patches)
-                    all_patches.append(final_patches)
+            # Run all views/frames as one larger image batch to reduce kernel launches.
+            bsz = pixel_values.shape[0]
+            batched_images = torch.cat(images, dim=0)
+            if self.use_mid_layer_temporal_fusion and self.num_temporal_frames > 1:
+                middle_flat, final_flat = self._forward_fused_image_middle_and_final(batched_images)
+                _, num_patches, dim = final_flat.shape
+                all_middle_patches = middle_flat.reshape(
+                    expected_images, bsz, num_patches, dim
+                ).transpose(0, 1)
+                all_patches = final_flat.reshape(expected_images, bsz, num_patches, dim).transpose(0, 1)
+            else:
+                final_flat = self._forward_fused_image(batched_images)
+                _, num_patches, dim = final_flat.shape
+                all_middle_patches = None
+                all_patches = final_flat.reshape(expected_images, bsz, num_patches, dim).transpose(0, 1)
 
             if self.num_temporal_frames == 1:
-                return torch.cat(all_patches, dim=1)
+                return all_patches.reshape(bsz, expected_images * num_patches, dim)
 
-            patch_stack = torch.stack(all_patches, dim=1)
-            bsz, _, num_patches, dim = patch_stack.shape
-            patch_stack = patch_stack.reshape(
+            patch_stack = all_patches.reshape(
                 bsz, self.num_images_in_input, self.num_temporal_frames, num_patches, dim
             )
             if all_middle_patches is not None:
-                middle_patch_stack = torch.stack(all_middle_patches, dim=1).reshape(
+                middle_patch_stack = all_middle_patches.reshape(
                     bsz, self.num_images_in_input, self.num_temporal_frames, num_patches, dim
                 )
                 temporal_delta = self.temporal_patch_attention(middle_patch_stack, return_delta=True)
@@ -653,30 +656,12 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         Returns:
             Modified input_embeddings tensor
         """
-        # Clone input to avoid modifying the original tensor
-        new_input_embeddings = input_embeddings.clone()
-
-        # Create a tensor with the same shape of input_embeddings to hold the noisy action features
-        repositioned_noisy_action_features = torch.zeros_like(input_embeddings)
-
-        # Create batch indices for splicing
-        batch_indices = torch.arange(input_embeddings.shape[0], device=input_embeddings.device)
-        batch_indices = batch_indices.unsqueeze(1).expand(-1, noisy_action_features.shape[1])
-
-        # Get indices where mask is True for each sample
-        masked_indices = torch.stack([torch.where(mask)[0] for mask in all_actions_mask])
-
-        # Move the noisy action features into their correct positions
-        # print(noisy_action_features.size())
-        
-        repositioned_noisy_action_features[batch_indices, masked_indices] = noisy_action_features
-
-        # Combine original input embeddings and noisy action embeddings using the mask
-        new_input_embeddings = torch.where(
-            all_actions_mask.unsqueeze(-1), repositioned_noisy_action_features, new_input_embeddings
-        )
-
-        return new_input_embeddings
+        # Rank True positions per row, then gather replacement tokens without dynamic nonzero indices.
+        ranks = all_actions_mask.to(torch.long).cumsum(dim=1) - 1
+        ranks = ranks.clamp(min=0, max=noisy_action_features.shape[1] - 1)
+        gather_index = ranks.unsqueeze(-1).expand(-1, -1, input_embeddings.shape[-1])
+        repositioned_features = noisy_action_features.gather(1, gather_index)
+        return torch.where(all_actions_mask.unsqueeze(-1), repositioned_features, input_embeddings)
 
     def _process_action_masks(self, labels):
         """Helper to get action masks from labels"""
@@ -1018,10 +1003,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Extend the attention mask to fit the new shape of input
         # Note: Only batch size == 1 supported right now
-        mask_extension = (
-            torch.ones((attention_mask.shape[0], input_ids.shape[-1] - attention_mask.shape[-1]))
-            .to(attention_mask.device)
-            .to(attention_mask.dtype)
+        mask_extension = torch.ones(
+            (attention_mask.shape[0], input_ids.shape[-1] - attention_mask.shape[-1]),
+            device=attention_mask.device,
+            dtype=attention_mask.dtype,
         )
         attention_mask = torch.cat([attention_mask, mask_extension], dim=-1)
 
@@ -1038,9 +1023,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Creates labels tensor for action prediction if not provided"""
         # Extend labels tensor with fake action labels
         ARBITRARY_ACTION_TOKEN_IDX = ACTION_TOKEN_BEGIN_IDX + 1
-        labels_extension = (
-            torch.ones((labels.shape[0], input_ids.shape[-1] - labels.shape[-1])).to(labels.device).to(labels.dtype)
-            * ARBITRARY_ACTION_TOKEN_IDX
+        labels_extension = torch.full(
+            (labels.shape[0], input_ids.shape[-1] - labels.shape[-1]),
+            ARBITRARY_ACTION_TOKEN_IDX,
+            device=labels.device,
+            dtype=labels.dtype,
         )
         labels = torch.cat([labels, labels_extension], dim=-1)
 
@@ -1167,9 +1154,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         proprio=None,
         proprio_projector=None,
+        latency_steps=None,
+        latency_projector=None,
+        latency_steps_scale=1.0,
         pred_mask=None,
         return_pred_confidence: bool = False,
         pred_confidence_cumulative_min: bool = True,
+        return_tensor: bool = False,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
 
@@ -1191,9 +1182,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Forward pass through language model
+        # Transformers' SDPA mask helper checks torch.all(attention_mask == 1),
+        # which is not CUDA Graph capturable. The graph path is fixed-shape and
+        # assumes no padded language tokens, so None is equivalent to an all-ones mask.
+        lm_attention_mask = None if return_tensor else multimodal_attention_mask
         language_model_output = self.language_model(
             input_ids=None,
-            attention_mask=multimodal_attention_mask,
+            attention_mask=lm_attention_mask,
             position_ids=None,
             past_key_values=None,
             inputs_embeds=multimodal_embeddings,
@@ -1207,21 +1202,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Extract hidden states for action tokens. If pred tokens are before action tokens, action slots
         # are shifted by NUM_PRED_TOKENS within the language segment.
         action_offset = NUM_PRED_TOKENS if (self.use_future_pred and self.pred_tokens_before_action) else 0
-        multi_layer_hidden_states = []
-
-        for item in language_model_output.hidden_states[0:]:
-            text_hidden_states = item
-            batch_size = item.shape[0]
-            start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
-            actions_hidden_states = text_hidden_states[
-                :, start : start + NUM_TOKENS, :,
-            ].reshape(batch_size, 1, NUM_TOKENS, -1).to(torch.bfloat16)
-
-            task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
-            all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
-            multi_layer_hidden_states.append(all_hidden_states)
-
-        multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
+        start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
+        task_hidden_states = torch.stack(
+            [item[:, :NUM_PATCHES, :] for item in language_model_output.hidden_states],
+            dim=1,
+        )
+        actions_hidden_states = torch.stack(
+            [item[:, start : start + NUM_TOKENS, :] for item in language_model_output.hidden_states],
+            dim=1,
+        ).to(torch.bfloat16)
+        multi_layer_hidden_states = torch.cat((task_hidden_states, actions_hidden_states), dim=2)
+        last_actions_hidden_states = actions_hidden_states[:, -1:]
         
 
         # Handle different prediction methods
@@ -1229,10 +1220,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             # L1 regression prediction
             normalized_actions = action_head.predict_action(multi_layer_hidden_states,
                                                 proprio=proprio,
-                                                proprio_projector=proprio_projector)
+                                                proprio_projector=proprio_projector,
+                                                latency_steps=latency_steps,
+                                                latency_projector=latency_projector,
+                                                latency_steps_scale=latency_steps_scale)
             normalized_actions = normalized_actions.reshape(input_embeddings.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM)
-            normalized_actions = normalized_actions.float().cpu().detach().numpy()
+            normalized_actions = normalized_actions.float()
+            if not return_tensor:
+                normalized_actions = normalized_actions.cpu().detach().numpy()
         else:
+            if return_tensor:
+                raise ValueError("return_tensor=True is only supported with a regression action_head.")
             # Discrete token-based prediction
             disc_start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
             predicted_action_token_ids = (
@@ -1268,7 +1266,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     cumulative_min=pred_confidence_cumulative_min,
                 )
 
-        return normalized_actions, actions_hidden_states, pred_info
+        return normalized_actions, last_actions_hidden_states, pred_info
 
 
     def predict_action(
@@ -1277,6 +1275,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         unnorm_key: Optional[str] = None,
         proprio=None,
         proprio_projector=None,
+        latency_steps=None,
+        latency_projector=None,
+        latency_steps_scale=1.0,
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
@@ -1300,6 +1301,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         pixel_values = kwargs["pixel_values"] # [1, 12, 224, 224]
         attention_mask = kwargs["attention_mask"] # 
+        return_normalized_tensor = bool(kwargs.pop("return_normalized_tensor", False))
+        if return_normalized_tensor and kwargs.get("return_pred_confidence", False):
+            raise ValueError("CUDA graph tensor path does not support return_pred_confidence.")
 
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
@@ -1328,9 +1332,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         if self.use_future_pred and pred_mask is not None:
             non_language_mask = non_language_mask | pred_mask
 
-        # Extract language embeddings
-        language_embeddings = input_embeddings[~non_language_mask].reshape(
-            input_embeddings.shape[0], -1, input_embeddings.shape[2]
+        # Language tokens are the original prompt plus the final stop token; action/pred
+        # placeholders are inserted between them. Static slicing keeps CUDA Graph capture valid.
+        language_embeddings = torch.cat(
+            [input_embeddings[:, : NUM_PROMPT_TOKENS + 1, :], input_embeddings[:, -1:, :]],
+            dim=1,
         )
 
         # Process vision features
@@ -1339,7 +1345,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
         if use_proprio:
-            proprio = torch.Tensor(proprio).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+            if isinstance(proprio, torch.Tensor):
+                proprio = proprio.to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+            else:
+                proprio = torch.as_tensor(
+                    proprio,
+                    device=projected_patch_embeddings.device,
+                    dtype=projected_patch_embeddings.dtype,
+                )
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
@@ -1356,11 +1369,18 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head=action_head,
             proprio=proprio, # [8]
             proprio_projector=proprio_projector,
+            latency_steps=latency_steps,
+            latency_projector=latency_projector,
+            latency_steps_scale=latency_steps_scale,
             pred_mask=pred_mask,
             return_pred_confidence=return_pred_confidence,
             pred_confidence_cumulative_min=kwargs.pop("pred_confidence_cumulative_min", True),
+            return_tensor=return_normalized_tensor,
             )
            
+        if return_normalized_tensor:
+            return normalized_actions, actions_hidden_states
+
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 

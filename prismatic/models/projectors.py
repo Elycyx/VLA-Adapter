@@ -24,6 +24,29 @@ class ProprioProjector(nn.Module):
         return projected_features
 
 
+class LatencyProjector(nn.Module):
+    """
+    Projects normalized inference-delay steps into the LLM embedding space.
+    """
+    def __init__(self, llm_dim: int) -> None:
+        super().__init__()
+        self.llm_dim = llm_dim
+        self.latency_dim = 1
+
+        self.fc1 = nn.Linear(self.latency_dim, self.llm_dim, bias=True)
+        self.fc2 = nn.Linear(self.llm_dim, self.llm_dim, bias=True)
+        self.act_fn1 = nn.GELU()
+
+    def forward(self, latency_steps: torch.Tensor = None) -> torch.Tensor:
+        # latency_steps: (bsz,) or (bsz, 1), normalized to the training range.
+        if latency_steps.dim() == 1:
+            latency_steps = latency_steps.unsqueeze(-1)
+        projected_features = self.fc1(latency_steps)
+        projected_features = self.act_fn1(projected_features)
+        projected_features = self.fc2(projected_features)
+        return projected_features
+
+
 class NoisyActionProjector(nn.Module):
     """
     [Diffusion] Projects noisy action inputs into the LLM's embedding space.

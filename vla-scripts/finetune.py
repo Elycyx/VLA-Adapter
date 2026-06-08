@@ -40,7 +40,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import L1RegressionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
-from prismatic.models.projectors import ProprioProjector
+from prismatic.models.projectors import LatencyProjector, ProprioProjector
 from prismatic.training.train_utils import (
     compute_actions_l1_loss,
     compute_token_accuracy,
@@ -88,12 +88,16 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     num_temporal_frames: int = 1                     # Number of temporal frames per camera view (1 preserves legacy behavior)
+    temporal_frame_interval: int = 1                 # Frame interval for temporal input; 1 => (t-1,t), 2 => (t-2,t)
     temporal_fusion_type: str = "attention"          # Temporal fusion: "attention" or "delta_mlp"
     use_current_query_temporal_attention: bool = False # If True, attention fusion updates current-frame tokens only
     use_mid_layer_temporal_fusion: bool = False      # If True, temporal fusion uses middle-layer vision features
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     use_relative_action: bool = False                # If True, train selected action dims as action - state deltas
     relative_action_mask: Optional[str] = None        # Comma-separated bool mask, e.g. true,true,false
+    use_latency_conditioning: bool = False           # If True, condition the action head on synthetic inference delay steps
+    latency_steps_min: int = 1                       # Minimum synthetic latency steps sampled during training
+    latency_steps_max: int = 5                       # Maximum synthetic latency steps sampled during training
     phase1_path: str = "None"
 
     # Training configuration
@@ -401,6 +405,7 @@ def run_forward_pass(
     vla,
     action_head,
     proprio_projector,
+    latency_projector,
     batch,
     action_tokenizer,
     device_id,
@@ -528,20 +533,38 @@ def run_forward_pass(
             multi_layer_hidden_states.append(all_hidden_states)
         multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
 
+        latency_steps = batch.get("latency_steps", None)
+        if latency_steps is not None:
+            latency_steps = latency_steps.to(device_id)
+
         predicted_actions = action_head.module.predict_action(
             multi_layer_hidden_states,
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
+            latency_steps=latency_steps,
+            latency_projector=latency_projector.module if latency_projector is not None else None,
+            latency_steps_scale=getattr(cfg, "latency_steps_max", 1),
             phase=cfg.phase,
             )
 
-        loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
+        action_pad_mask = batch.get("action_pad_mask", None)
+        if action_pad_mask is not None:
+            action_pad_mask = action_pad_mask.to(device_id).unsqueeze(-1).to(predicted_actions.dtype)
+            action_l1 = torch.abs(predicted_actions - ground_truth_actions)
+            valid_count = action_pad_mask.expand_as(action_l1).sum().clamp_min(1.0)
+            loss = (action_l1 * action_pad_mask).sum() / valid_count
+        else:
+            loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
 
         metrics.update(
             {
                 "loss_value": loss.item(),  # Detached value for logging
             }
         )
+        if latency_steps is not None:
+            metrics["latency_steps_mean"] = latency_steps.float().mean().item()
+            metrics["latency_steps_min"] = latency_steps.float().min().item()
+            metrics["latency_steps_max"] = latency_steps.float().max().item()
 
         # Get detailed L1 losses for logging
         should_log_l1_loss = use_l1_regression
@@ -550,8 +573,18 @@ def run_forward_pass(
             predicted_curr_action = predicted_actions[:, 0]
             ground_truth_next_actions = ground_truth_actions[:, 1:]
             predicted_next_actions = predicted_actions[:, 1:]
-            curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
-            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
+            if action_pad_mask is not None:
+                curr_mask = action_pad_mask[:, 0]
+                next_mask = action_pad_mask[:, 1:]
+                curr_action_l1_loss = (
+                    torch.abs(ground_truth_curr_action - predicted_curr_action) * curr_mask
+                ).sum() / curr_mask.expand_as(ground_truth_curr_action).sum().clamp_min(1.0)
+                next_actions_l1_loss = (
+                    torch.abs(ground_truth_next_actions - predicted_next_actions) * next_mask
+                ).sum() / next_mask.expand_as(ground_truth_next_actions).sum().clamp_min(1.0)
+            else:
+                curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
+                next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
             if compute_diffusion_l1:
                 print('curr: ',curr_action_l1_loss.item())
                 # print('next: ',next_actions_l1_loss.item())
@@ -703,6 +736,7 @@ def save_training_checkpoint(
     vla,
     processor,
     proprio_projector,
+    latency_projector,
     noisy_action_projector,
     action_head,
     train_dataset,
@@ -761,6 +795,9 @@ def save_training_checkpoint(
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
             torch.save(proprio_projector.state_dict(), checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}")
+
+        if cfg.use_latency_conditioning and latency_projector is not None:
+            torch.save(latency_projector.state_dict(), checkpoint_dir / f"latency_projector--{checkpoint_name_suffix}")
 
         if cfg.use_diffusion and noisy_action_projector is not None:
             torch.save(
@@ -838,6 +875,7 @@ def run_validation(
     action_head,
     noisy_action_projector,
     proprio_projector,
+    latency_projector,
     val_dataloader,
     action_tokenizer,
     device_id,
@@ -881,6 +919,7 @@ def run_validation(
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector,
+                latency_projector=latency_projector,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -889,7 +928,8 @@ def run_validation(
                 use_film=cfg.use_film,
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
-                use_pro_version=cfg.use_pro_version
+                use_pro_version=cfg.use_pro_version,
+                cfg=cfg,
             )
 
             # Add the loss value to the metrics
@@ -948,6 +988,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
     if cfg.use_future_conf and not cfg.use_future_pred:
         raise ValueError("use_future_conf=True requires use_future_pred=True.")
+    if cfg.use_latency_conditioning:
+        if cfg.latency_steps_min < 0 or cfg.latency_steps_max < cfg.latency_steps_min:
+            raise ValueError(
+                "use_latency_conditioning=True requires "
+                "0 <= latency_steps_min <= latency_steps_max."
+            )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.config_file_path = cfg.config_file_path.rstrip("/")
@@ -1162,6 +1208,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_future_pred and hasattr(vla, "_set_static_graph"):
         vla._set_static_graph()
 
+    proprio_projector = None
+    latency_projector = None
+    action_head = None
+
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
         proprio_projector = init_module(
@@ -1170,6 +1220,16 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            to_bf16=True,
+        )
+
+    if cfg.use_latency_conditioning:
+        latency_projector = init_module(
+            LatencyProjector,
+            "latency_projector",
+            cfg,
+            device_id,
+            {"llm_dim": vla.module.llm_dim},
             to_bf16=True,
         )
 
@@ -1200,6 +1260,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    if cfg.use_latency_conditioning:
+        trainable_params += [param for param in latency_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -1255,6 +1317,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         pred_tokens_before_action=cfg.pred_tokens_before_action,
         future_pred_feature_dir=cfg.future_pred_feature_dir,
         num_temporal_frames=cfg.num_temporal_frames,
+        temporal_frame_interval=cfg.temporal_frame_interval,
+        use_latency_conditioning=cfg.use_latency_conditioning,
+        latency_steps_min=cfg.latency_steps_min,
+        latency_steps_max=cfg.latency_steps_max,
         )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1267,6 +1333,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         relative_action_mask=cfg.relative_action_mask,
         use_future_pred=cfg.use_future_pred,
         num_temporal_frames=cfg.num_temporal_frames,
+        temporal_frame_interval=cfg.temporal_frame_interval,
+        use_latency_conditioning=cfg.use_latency_conditioning,
+        latency_steps_min=cfg.latency_steps_min,
+        latency_steps_max=cfg.latency_steps_max,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1281,6 +1351,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             relative_action_mask=cfg.relative_action_mask,
             use_future_pred=cfg.use_future_pred,
             num_temporal_frames=cfg.num_temporal_frames,
+            temporal_frame_interval=cfg.temporal_frame_interval,
+            use_latency_conditioning=cfg.use_latency_conditioning,
+            latency_steps_min=cfg.latency_steps_min,
+            latency_steps_max=cfg.latency_steps_max,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1331,6 +1405,12 @@ def finetune(cfg: FinetuneConfig) -> None:
             "pred_confidence_mean": deque(maxlen=cfg.grad_accumulation_steps),
             "pred_confidence_target_mean": deque(maxlen=cfg.grad_accumulation_steps),
         })
+    if cfg.use_latency_conditioning:
+        recent_metrics.update({
+            "latency_steps_mean": deque(maxlen=cfg.grad_accumulation_steps),
+            "latency_steps_min": deque(maxlen=cfg.grad_accumulation_steps),
+            "latency_steps_max": deque(maxlen=cfg.grad_accumulation_steps),
+        })
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -1343,6 +1423,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
+                latency_projector=latency_projector if cfg.use_latency_conditioning else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -1410,6 +1491,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     vla=vla,
                     processor=processor,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    latency_projector=latency_projector if cfg.use_latency_conditioning else None,
                     noisy_action_projector=None,
                     action_head=action_head,
                     train_dataset=train_dataset,
@@ -1424,6 +1506,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     action_head=action_head,
                     noisy_action_projector=None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    latency_projector=latency_projector if cfg.use_latency_conditioning else None,
                     val_dataloader=val_dataloader,
                     action_tokenizer=action_tokenizer,
                     device_id=device_id,

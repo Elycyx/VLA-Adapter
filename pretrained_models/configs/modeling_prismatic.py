@@ -653,30 +653,12 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         Returns:
             Modified input_embeddings tensor
         """
-        # Clone input to avoid modifying the original tensor
-        new_input_embeddings = input_embeddings.clone()
-
-        # Create a tensor with the same shape of input_embeddings to hold the noisy action features
-        repositioned_noisy_action_features = torch.zeros_like(input_embeddings)
-
-        # Create batch indices for splicing
-        batch_indices = torch.arange(input_embeddings.shape[0], device=input_embeddings.device)
-        batch_indices = batch_indices.unsqueeze(1).expand(-1, noisy_action_features.shape[1])
-
-        # Get indices where mask is True for each sample
-        masked_indices = torch.stack([torch.where(mask)[0] for mask in all_actions_mask])
-
-        # Move the noisy action features into their correct positions
-        # print(noisy_action_features.size())
-        
-        repositioned_noisy_action_features[batch_indices, masked_indices] = noisy_action_features
-
-        # Combine original input embeddings and noisy action embeddings using the mask
-        new_input_embeddings = torch.where(
-            all_actions_mask.unsqueeze(-1), repositioned_noisy_action_features, new_input_embeddings
-        )
-
-        return new_input_embeddings
+        # Rank True positions per row, then gather replacement tokens without dynamic nonzero indices.
+        ranks = all_actions_mask.to(torch.long).cumsum(dim=1) - 1
+        ranks = ranks.clamp(min=0, max=noisy_action_features.shape[1] - 1)
+        gather_index = ranks.unsqueeze(-1).expand(-1, -1, input_embeddings.shape[-1])
+        repositioned_features = noisy_action_features.gather(1, gather_index)
+        return torch.where(all_actions_mask.unsqueeze(-1), repositioned_features, input_embeddings)
 
     def _process_action_masks(self, labels):
         """Helper to get action masks from labels"""
@@ -1018,10 +1000,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Extend the attention mask to fit the new shape of input
         # Note: Only batch size == 1 supported right now
-        mask_extension = (
-            torch.ones((attention_mask.shape[0], input_ids.shape[-1] - attention_mask.shape[-1]))
-            .to(attention_mask.device)
-            .to(attention_mask.dtype)
+        mask_extension = torch.ones(
+            (attention_mask.shape[0], input_ids.shape[-1] - attention_mask.shape[-1]),
+            device=attention_mask.device,
+            dtype=attention_mask.dtype,
         )
         attention_mask = torch.cat([attention_mask, mask_extension], dim=-1)
 
@@ -1038,9 +1020,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Creates labels tensor for action prediction if not provided"""
         # Extend labels tensor with fake action labels
         ARBITRARY_ACTION_TOKEN_IDX = ACTION_TOKEN_BEGIN_IDX + 1
-        labels_extension = (
-            torch.ones((labels.shape[0], input_ids.shape[-1] - labels.shape[-1])).to(labels.device).to(labels.dtype)
-            * ARBITRARY_ACTION_TOKEN_IDX
+        labels_extension = torch.full(
+            (labels.shape[0], input_ids.shape[-1] - labels.shape[-1]),
+            ARBITRARY_ACTION_TOKEN_IDX,
+            device=labels.device,
+            dtype=labels.dtype,
         )
         labels = torch.cat([labels, labels_extension], dim=-1)
 
@@ -1167,9 +1151,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         proprio=None,
         proprio_projector=None,
+        latency_steps=None,
+        latency_projector=None,
+        latency_steps_scale=1.0,
         pred_mask=None,
         return_pred_confidence: bool = False,
         pred_confidence_cumulative_min: bool = True,
+        return_tensor: bool = False,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
 
@@ -1191,9 +1179,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Forward pass through language model
+        # Transformers' SDPA mask helper checks torch.all(attention_mask == 1),
+        # which is not CUDA Graph capturable. The graph path is fixed-shape and
+        # assumes no padded language tokens, so None is equivalent to an all-ones mask.
+        lm_attention_mask = None if return_tensor else multimodal_attention_mask
         language_model_output = self.language_model(
             input_ids=None,
-            attention_mask=multimodal_attention_mask,
+            attention_mask=lm_attention_mask,
             position_ids=None,
             past_key_values=None,
             inputs_embeds=multimodal_embeddings,
@@ -1229,10 +1221,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             # L1 regression prediction
             normalized_actions = action_head.predict_action(multi_layer_hidden_states,
                                                 proprio=proprio,
-                                                proprio_projector=proprio_projector)
+                                                proprio_projector=proprio_projector,
+                                                latency_steps=latency_steps,
+                                                latency_projector=latency_projector,
+                                                latency_steps_scale=latency_steps_scale)
             normalized_actions = normalized_actions.reshape(input_embeddings.shape[0], NUM_ACTIONS_CHUNK, ACTION_DIM)
-            normalized_actions = normalized_actions.float().cpu().detach().numpy()
+            normalized_actions = normalized_actions.float()
+            if not return_tensor:
+                normalized_actions = normalized_actions.cpu().detach().numpy()
         else:
+            if return_tensor:
+                raise ValueError("return_tensor=True is only supported with a regression action_head.")
             # Discrete token-based prediction
             disc_start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
             predicted_action_token_ids = (
@@ -1277,6 +1276,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         unnorm_key: Optional[str] = None,
         proprio=None,
         proprio_projector=None,
+        latency_steps=None,
+        latency_projector=None,
+        latency_steps_scale=1.0,
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
@@ -1300,6 +1302,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         pixel_values = kwargs["pixel_values"] # [1, 12, 224, 224]
         attention_mask = kwargs["attention_mask"] # 
+        return_normalized_tensor = bool(kwargs.pop("return_normalized_tensor", False))
+        if return_normalized_tensor and kwargs.get("return_pred_confidence", False):
+            raise ValueError("CUDA graph tensor path does not support return_pred_confidence.")
 
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
@@ -1328,9 +1333,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         if self.use_future_pred and pred_mask is not None:
             non_language_mask = non_language_mask | pred_mask
 
-        # Extract language embeddings
-        language_embeddings = input_embeddings[~non_language_mask].reshape(
-            input_embeddings.shape[0], -1, input_embeddings.shape[2]
+        # Language tokens are the original prompt plus the final stop token; action/pred
+        # placeholders are inserted between them. Static slicing keeps CUDA Graph capture valid.
+        language_embeddings = torch.cat(
+            [input_embeddings[:, : NUM_PROMPT_TOKENS + 1, :], input_embeddings[:, -1:, :]],
+            dim=1,
         )
 
         # Process vision features
@@ -1339,7 +1346,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
         if use_proprio:
-            proprio = torch.Tensor(proprio).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+            if isinstance(proprio, torch.Tensor):
+                proprio = proprio.to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+            else:
+                proprio = torch.as_tensor(
+                    proprio,
+                    device=projected_patch_embeddings.device,
+                    dtype=projected_patch_embeddings.dtype,
+                )
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
@@ -1356,11 +1370,18 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head=action_head,
             proprio=proprio, # [8]
             proprio_projector=proprio_projector,
+            latency_steps=latency_steps,
+            latency_projector=latency_projector,
+            latency_steps_scale=latency_steps_scale,
             pred_mask=pred_mask,
             return_pred_confidence=return_pred_confidence,
             pred_confidence_cumulative_min=kwargs.pop("pred_confidence_cumulative_min", True),
+            return_tensor=return_normalized_tensor,
             )
            
+        if return_normalized_tensor:
+            return normalized_actions, actions_hidden_states
+
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
