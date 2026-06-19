@@ -215,6 +215,12 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     "pick_place_conveyor": [
         ("pick_place_conveyor", 1.0),
     ],
+    "rmbench": [
+        ("pick_place_conveyor_rlds", 1.0),
+        ("orangeinterception_rlds", 1.0),
+        ("whackamole_rlds", 1.0),
+        ("ballcatching_rlds", 1.0),
+    ],
 
     # === ALOHA Fine-Tuning Datasets ===
     "aloha1_fold_shorts_20_demos": [

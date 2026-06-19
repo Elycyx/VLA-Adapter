@@ -206,7 +206,10 @@ class RLDSBatchTransform:
             return_dict["future_recon_pixels"] = self._future_images_to_rgb_tensor(future_imgs)
             if self.load_future_pred_features:
                 future_features = np.stack(
-                    [load_feature(self.future_pred_feature_dir, future_imgs[i]) for i in range(future_imgs.shape[0])],
+                    [
+                        load_feature(self.future_pred_feature_dir, future_imgs[i], dataset_name=dataset_name)
+                        for i in range(future_imgs.shape[0])
+                    ],
                     axis=0,
                 )
                 if future_features.shape[-1] != DINO_V3_FEATURE_DIM:

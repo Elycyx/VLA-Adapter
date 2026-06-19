@@ -400,27 +400,30 @@ class PrismaticVisionBackbone(nn.Module):
                 )
             images = torch.split(pixel_values, [6] * expected_images, dim=1)
 
-            # Process each image and collect patches
-            all_patches = []
-            all_middle_patches = [] if self.use_mid_layer_temporal_fusion and self.num_temporal_frames > 1 else None
-            for img in images:
-                if all_middle_patches is None:
-                    all_patches.append(self._forward_fused_image(img))
-                else:
-                    middle_patches, final_patches = self._forward_fused_image_middle_and_final(img)
-                    all_middle_patches.append(middle_patches)
-                    all_patches.append(final_patches)
+            # Run all views/frames as one larger image batch to reduce kernel launches.
+            bsz = pixel_values.shape[0]
+            batched_images = torch.cat(images, dim=0)
+            if self.use_mid_layer_temporal_fusion and self.num_temporal_frames > 1:
+                middle_flat, final_flat = self._forward_fused_image_middle_and_final(batched_images)
+                _, num_patches, dim = final_flat.shape
+                all_middle_patches = middle_flat.reshape(
+                    expected_images, bsz, num_patches, dim
+                ).transpose(0, 1)
+                all_patches = final_flat.reshape(expected_images, bsz, num_patches, dim).transpose(0, 1)
+            else:
+                final_flat = self._forward_fused_image(batched_images)
+                _, num_patches, dim = final_flat.shape
+                all_middle_patches = None
+                all_patches = final_flat.reshape(expected_images, bsz, num_patches, dim).transpose(0, 1)
 
             if self.num_temporal_frames == 1:
-                return torch.cat(all_patches, dim=1)
+                return all_patches.reshape(bsz, expected_images * num_patches, dim)
 
-            patch_stack = torch.stack(all_patches, dim=1)
-            bsz, _, num_patches, dim = patch_stack.shape
-            patch_stack = patch_stack.reshape(
+            patch_stack = all_patches.reshape(
                 bsz, self.num_images_in_input, self.num_temporal_frames, num_patches, dim
             )
             if all_middle_patches is not None:
-                middle_patch_stack = torch.stack(all_middle_patches, dim=1).reshape(
+                middle_patch_stack = all_middle_patches.reshape(
                     bsz, self.num_images_in_input, self.num_temporal_frames, num_patches, dim
                 )
                 temporal_delta = self.temporal_patch_attention(middle_patch_stack, return_delta=True)
@@ -1199,21 +1202,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Extract hidden states for action tokens. If pred tokens are before action tokens, action slots
         # are shifted by NUM_PRED_TOKENS within the language segment.
         action_offset = NUM_PRED_TOKENS if (self.use_future_pred and self.pred_tokens_before_action) else 0
-        multi_layer_hidden_states = []
-
-        for item in language_model_output.hidden_states[0:]:
-            text_hidden_states = item
-            batch_size = item.shape[0]
-            start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
-            actions_hidden_states = text_hidden_states[
-                :, start : start + NUM_TOKENS, :,
-            ].reshape(batch_size, 1, NUM_TOKENS, -1).to(torch.bfloat16)
-
-            task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
-            all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
-            multi_layer_hidden_states.append(all_hidden_states)
-
-        multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
+        start = NUM_PATCHES + NUM_PROMPT_TOKENS + action_offset
+        task_hidden_states = torch.stack(
+            [item[:, :NUM_PATCHES, :] for item in language_model_output.hidden_states],
+            dim=1,
+        )
+        actions_hidden_states = torch.stack(
+            [item[:, start : start + NUM_TOKENS, :] for item in language_model_output.hidden_states],
+            dim=1,
+        ).to(torch.bfloat16)
+        multi_layer_hidden_states = torch.cat((task_hidden_states, actions_hidden_states), dim=2)
+        last_actions_hidden_states = actions_hidden_states[:, -1:]
         
 
         # Handle different prediction methods
@@ -1267,7 +1266,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                     cumulative_min=pred_confidence_cumulative_min,
                 )
 
-        return normalized_actions, actions_hidden_states, pred_info
+        return normalized_actions, last_actions_hidden_states, pred_info
 
 
     def predict_action(

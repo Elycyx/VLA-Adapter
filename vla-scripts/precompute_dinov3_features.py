@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.machinery
 import json
+import sys
+import types
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -40,6 +43,47 @@ import numpy as np
 import torch
 import tqdm
 from PIL import Image
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def install_prismatic_namespace_stubs() -> None:
+    """Expose RLDS/OXE modules without executing Prismatic's model-heavy package init."""
+    package_paths = {
+        "prismatic": REPO_ROOT / "prismatic",
+        "prismatic.vla": REPO_ROOT / "prismatic" / "vla",
+        "prismatic.vla.datasets": REPO_ROOT / "prismatic" / "vla" / "datasets",
+        "prismatic.vla.datasets.rlds": REPO_ROOT / "prismatic" / "vla" / "datasets" / "rlds",
+        "prismatic.vla.datasets.rlds.oxe": REPO_ROOT / "prismatic" / "vla" / "datasets" / "rlds" / "oxe",
+        "prismatic.vla.datasets.rlds.oxe.utils": REPO_ROOT
+        / "prismatic"
+        / "vla"
+        / "datasets"
+        / "rlds"
+        / "oxe"
+        / "utils",
+        "prismatic.vla.datasets.rlds.utils": REPO_ROOT / "prismatic" / "vla" / "datasets" / "rlds" / "utils",
+    }
+
+    for name, path in package_paths.items():
+        if name in sys.modules:
+            continue
+        module = types.ModuleType(name)
+        module.__path__ = [str(path)]
+        module.__package__ = name
+        spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+        spec.submodule_search_locations = [str(path)]
+        module.__spec__ = spec
+        sys.modules[name] = module
+
+        parent_name, _, child_name = name.rpartition(".")
+        if parent_name and parent_name in sys.modules:
+            setattr(sys.modules[parent_name], child_name, module)
+
+
+install_prismatic_namespace_stubs()
 
 # --- cache helpers (must stay compatible with prismatic/vla/datasets/dinov3_features.py) ---
 
@@ -365,11 +409,6 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    from transformers import AutoImageProcessor, AutoModel
-
-    processor = AutoImageProcessor.from_pretrained(args.model_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True).to(args.device).eval()
-
     pending_images: List[Image.Image] = []
     pending_hashes: List[str] = []
     seen: set[str] = set()
@@ -401,6 +440,11 @@ def main() -> None:
         samples += 1
 
     if args.images_dir is not None:
+        from transformers import AutoImageProcessor, AutoModel
+
+        processor = AutoImageProcessor.from_pretrained(args.model_id, trust_remote_code=True)
+        model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True).to(args.device).eval()
+
         if not args.images_dir.is_dir():
             raise FileNotFoundError(args.images_dir)
         for path in tqdm.tqdm(list(_iter_images_dir(args.images_dir)), desc="images_dir"):
@@ -421,6 +465,11 @@ def main() -> None:
 
     with open(args.spec_pickle, "rb") as f:
         entries: List[Dict[str, Any]] = pickle.load(f)
+
+    from transformers import AutoImageProcessor, AutoModel
+
+    processor = AutoImageProcessor.from_pretrained(args.model_id, trust_remote_code=True)
+    model = AutoModel.from_pretrained(args.model_id, trust_remote_code=True).to(args.device).eval()
 
     for cfg in entries:
         if args.max_samples is not None and samples >= args.max_samples:

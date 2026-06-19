@@ -873,11 +873,30 @@ def pick_place_conveyor_dataset_transform(trajectory: Dict[str, Any]) -> Dict[st
     return trajectory
 
 
+def merged_rmbench_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep absolute joint-space format as-is: 7 joints + gripper.
+    return trajectory
+
 
 def aloha_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     # Don't need to do anything because dataset is already in the correct format
     return trajectory
 
+def orangeinterception_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep absolute joint-space format as-is: 7 joints + gripper.
+    return trajectory
+
+def whackamole_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep absolute joint-space format as-is: 7 joints + gripper.
+    return trajectory
+
+def ballcatching_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep absolute joint-space format as-is: 7 joints + gripper.
+    return trajectory
+
+def rmbench_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep absolute joint-space format as-is: 7 joints + gripper.
+    return trajectory
 
 # === Registry ===
 OXE_STANDARDIZATION_TRANSFORMS = {
@@ -961,6 +980,13 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "calvin_abc_rlds": calvin_dataset_transform,
     "calvin": calvin_dataset_transform,
     "pick_place_conveyor": pick_place_conveyor_dataset_transform,
+    "merged_rmbench": merged_rmbench_dataset_transform,
+    "pick_place_conveyor_rlds": pick_place_conveyor_dataset_transform,
+    "orangeinterception_rlds": orangeinterception_dataset_transform,
+    "whackamole_rlds": whackamole_dataset_transform,
+    "ballcatching_rlds": ballcatching_dataset_transform,
+    "rmbench": rmbench_dataset_transform,
+    "remanipbench_rlds": rmbench_dataset_transform,
     ### ALOHA fine-tuning datasets
     "aloha1_fold_shorts_20_demos": aloha_dataset_transform,
     "aloha1_fold_shirt_30_demos": aloha_dataset_transform,

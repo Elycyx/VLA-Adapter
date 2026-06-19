@@ -46,6 +46,13 @@ PICK_PLACE_CONVEYOR_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+RMBENCH_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,
+    "ACTION_DIM": 8,
+    "PROPRIO_DIM": 8,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
+
 ALOHA_CONSTANTS = {
     "NUM_ACTIONS_CHUNK": 25,
     "ACTION_DIM": 14,
@@ -75,6 +82,8 @@ def detect_robot_platform():
         return "CALVIN"
     elif "pick_place_conveyor" in cmd_args:
         return "PICK_PLACE_CONVEYOR"
+    elif "rmbench" or "remanipbench" in cmd_args:
+        return "RMBENCH"
     else:
         # Default to LIBERO if unclear
         return "LIBERO"
@@ -94,6 +103,8 @@ elif ROBOT_PLATFORM == "CALVIN":
     constants = CALVIN_CONSTANTS
 elif ROBOT_PLATFORM == "PICK_PLACE_CONVEYOR":
     constants = PICK_PLACE_CONVEYOR_CONSTANTS
+elif ROBOT_PLATFORM == "RMBENCH":
+    constants = RMBENCH_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
