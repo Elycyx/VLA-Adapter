@@ -5,8 +5,8 @@ Fine-tunes Qwen2.5-0.5B via LoRA.
 """
 
 import os
+import gc
 import time
-import inspect
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -178,16 +178,16 @@ def remove_ddp_in_checkpoint(state_dict) -> dict:
     return new_state_dict
 
 
-def _lora_target_linear_suffixes_excluding(module: nn.Module, exclude_name_substrings: Tuple[str, ...]) -> list[str]:
-    """Unique last-name segments of `nn.Linear` layers for PEFT `target_modules`, skipping given name substrings."""
-    suffixes: set[str] = set()
+def _lora_target_linear_names_excluding(module: nn.Module, exclude_name_substrings: Tuple[str, ...]) -> list[str]:
+    """Full names of `nn.Linear` layers for PEFT `target_modules`, skipping given name substrings."""
+    names: list[str] = []
     for name, mod in module.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
         if any(s in name for s in exclude_name_substrings):
             continue
-        suffixes.add(name.rsplit(".", 1)[-1])
-    return sorted(suffixes)
+        names.append(name)
+    return names
 
 
 def _unwrap_peft_model(model: nn.Module) -> nn.Module:
@@ -841,30 +841,41 @@ def save_training_checkpoint(
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
-        if cfg.use_minivlm:
-            config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
-            base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)  # Create a new model with configuration, the parameters are randomly initialized
-            # print(new_state_dict['action_queries.weight'])
-            new_state_dict['action_queries.weight'] = vla.state_dict()['module.base_model.model.action_queries.weight'].cpu()
-            missing_keys, unexpected_keys = base_vla.load_state_dict(new_state_dict, strict=False)
-            
-        else:
-            base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.config_file_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False, trust_remote_code=False
-        )
-
-        trained_temporal = _get_temporal_patch_attention(vla)
-        base_temporal = _get_temporal_patch_attention(base_vla)
-        if trained_temporal is not None and base_temporal is not None and cfg.num_temporal_frames > 1:
-            base_temporal.load_state_dict(_plain_temporal_patch_attention_state_dict(trained_temporal))
-
-        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-        merged_vla = merged_vla.merge_and_unload()
-
         if distributed_state.is_main_process:
-            merged_vla.save_pretrained(checkpoint_dir)
-            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
-        
+            base_vla = None
+            merged_vla = None
+            try:
+                if cfg.use_minivlm:
+                    config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
+                    # Create a fresh base model only on the rank that writes the merged checkpoint.
+                    base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)
+                    new_state_dict["action_queries.weight"] = vla.state_dict()[
+                        "module.base_model.model.action_queries.weight"
+                    ].cpu()
+                    missing_keys, unexpected_keys = base_vla.load_state_dict(new_state_dict, strict=False)
+                else:
+                    base_vla = AutoModelForVision2Seq.from_pretrained(
+                        cfg.config_file_path,
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=False,
+                        trust_remote_code=False,
+                    )
+
+                trained_temporal = _get_temporal_patch_attention(vla)
+                base_temporal = _get_temporal_patch_attention(base_vla)
+                if trained_temporal is not None and base_temporal is not None and cfg.num_temporal_frames > 1:
+                    base_temporal.load_state_dict(_plain_temporal_patch_attention_state_dict(trained_temporal))
+
+                merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+                merged_vla = merged_vla.merge_and_unload()
+                merged_vla.save_pretrained(checkpoint_dir)
+                print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+            finally:
+                del merged_vla
+                del base_vla
+                gc.collect()
+                torch.cuda.empty_cache()
+
         # Wait for merged model to be saved
         dist.barrier()
 
@@ -1132,9 +1143,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             vla.set_use_future_conf(cfg.use_future_conf, cfg.future_confidence_gamma)
 
     if cfg.use_lora:
-        # Future-pred: keep pred heads as plain Linear layers to avoid DDP "marked ready twice"
-        # on shared paths. Newer PEFT supports `exclude_modules`; older PEFT needs an explicit
-        # `target_modules` list derived from all Linear layers minus the pred heads.
+        # Use full module names instead of PEFT's `all-linear` expansion: suffixes like "0"
+        # can also match non-Linear modules such as ViT `blocks.0`.
         lora_kw = dict(
             r=cfg.lora_rank,
             lora_alpha=2 * cfg.lora_rank,
@@ -1145,25 +1155,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         if cfg.use_future_pred:
             lora_exclude_modules.extend(["pred_head", "pred_confidence_head"])
 
-        if "exclude_modules" in inspect.signature(LoraConfig).parameters:
-            lora_kw["target_modules"] = "all-linear"
-            lora_kw["exclude_modules"] = lora_exclude_modules
-        elif cfg.use_future_pred:
-            suffixes = _lora_target_linear_suffixes_excluding(
-                vla,
-                ("pred_head", "pred_confidence_head", "temporal_patch_attention"),
-            )
-            if not suffixes:
-                raise RuntimeError(
-                    "Could not build LoRA target_modules after excluding pred heads (no Linear layers left?)."
-                )
-            lora_kw["target_modules"] = suffixes
-        else:
-            suffixes = _lora_target_linear_suffixes_excluding(vla, ("temporal_patch_attention",))
-            if suffixes:
-                lora_kw["target_modules"] = suffixes
-            else:
-                lora_kw["target_modules"] = "all-linear"
+        target_modules = _lora_target_linear_names_excluding(vla, tuple(lora_exclude_modules))
+        if not target_modules:
+            raise RuntimeError("Could not build LoRA target_modules after exclusions (no Linear layers left?).")
+        lora_kw["target_modules"] = target_modules
         lora_config = LoraConfig(**lora_kw)
         vla = get_peft_model(vla, lora_config)
         _strip_lora_from_temporal_patch_attention(vla)

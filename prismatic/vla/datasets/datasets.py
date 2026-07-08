@@ -41,6 +41,7 @@ class RLDSBatchTransform:
     pred_tokens_before_action: bool = False
     future_pred_feature_dir: Optional[Path] = None
     load_future_pred_features: bool = True
+    load_future_recon_pixels: bool = False
     future_recon_size: Optional[Tuple[int, int]] = None
     num_temporal_frames: int = 1
     temporal_frame_interval: int = 1
@@ -203,7 +204,8 @@ class RLDSBatchTransform:
             )
             return_dict["pred_mask"] = pred_mask
             return_dict["future_pad_mask"] = future_pad_mask
-            return_dict["future_recon_pixels"] = self._future_images_to_rgb_tensor(future_imgs)
+            if self.load_future_recon_pixels:
+                return_dict["future_recon_pixels"] = self._future_images_to_rgb_tensor(future_imgs)
             if self.load_future_pred_features:
                 future_features = np.stack(
                     [

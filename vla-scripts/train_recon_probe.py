@@ -329,6 +329,7 @@ def train_recon_probe(cfg: ReconProbeConfig) -> None:
         use_future_pred=True,
         pred_tokens_before_action=cfg.pred_tokens_before_action,
         load_future_pred_features=False,
+        load_future_recon_pixels=True,
         future_recon_size=target_size,
     )
     train_dataset = RLDSDataset(

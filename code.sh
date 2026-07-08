@@ -3,15 +3,15 @@ dinov3_feature_dir=/mnt/lx/cyx/lerobot/dinov3_features/$data_name
 dinov3_rlds_spec=/mnt/lx/cyx/lerobot/dinov3_features/${data_name}.rlds_spec.pkl
 
 # Step 1 (VLA / Prismatic env): export RLDS kwargs + dataset_statistics into a pickle.
-CUDA_VISIBLE_DEVICES=2 python vla-scripts/export_dinov3_rlds_spec.py \
---data_root_dir /mnt/lx/cyx/lerobot/dataset \
---dataset_name 'remanipbench_rlds' \
---output /mnt/lx/cyx/lerobot/dinov3_features/remanipbench_rlds.rlds_spec.pkl
+CUDA_VISIBLE_DEVICES=7 python vla-scripts/export_dinov3_rlds_spec.py \
+--data_root_dir /mnt/lx/cyx/openvla/modified_libero_rlds \
+--dataset_name 'libero_10_no_noops' \
+--output /mnt/lx/cyx/lerobot/dinov3_features/libero_10_no_noops.rlds_spec.pkl
 
 # Step 2 (DINOv3-friendly env, no Prismatic): precompute features from the spec.
-CUDA_VISIBLE_DEVICES=2 python vla-scripts/precompute_dinov3_features.py \
---spec_pickle /mnt/lx/cyx/lerobot/dinov3_features/remanipbench_rlds.rlds_spec.pkl \
---output_dir /mnt/lx/cyx/lerobot/dinov3_features/remanipbench_rlds \
+CUDA_VISIBLE_DEVICES=7 python vla-scripts/precompute_dinov3_features.py \
+--spec_pickle /mnt/lx/cyx/lerobot/dinov3_features/libero_10_no_noops.rlds_spec.pkl \
+--output_dir /mnt/lx/cyx/lerobot/dinov3_features/libero_10_no_noops \
 --resize_resolution 224,224 \
 --model_id ./dinov3-vitl16-pretrain-lvd1689m \
 --batch_size 64
@@ -21,6 +21,49 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-no
 --config_file_path pretrained_models/configs \
 --data_root_dir /mnt/lx/cyx/lerobot/dataset \
 --dataset_name 'remanipbench_rlds' \
+--run_root_dir outputs \
+--use_film False \
+--num_images_in_input 2 \
+--num_temporal_frames 2 \
+--temporal_frame_interval 1 \
+--temporal_fusion_type attention \
+--use_current_query_temporal_attention False \
+--use_mid_layer_temporal_fusion True \
+--use_proprio True \
+--use_lora True \
+--use_fz False \
+--use_minivlm True \
+--image_aug True \
+--num_steps_before_decay 100000 \
+--max_steps 120005 \
+--save_freq 5000 \
+--save_latest_checkpoint_only False \
+--merge_lora_during_training True \
+--batch_size 8 \
+--grad_accumulation_steps 1 \
+--learning_rate 2e-4 \
+--lora_rank 64 \
+--use_pro_version True \
+--use_future_pred True \
+--use_future_conf False \
+--future_confidence_gamma 1.0 \
+--future_conf_loss_weight 0.1 \
+--pred_tokens_before_action False \
+--future_pred_feature_dir /mnt/lx/cyx/lerobot/dinov3_features/remanipbench_rlds \
+--future_pred_loss_weight 0.05 \
+--use_latency_conditioning False \
+--latency_steps_min 0 \
+--latency_steps_max 6 \
+--run_id_note VLA-Adapter--remanipbench_rlds--pred--2frame--attn--mid_layer--$current_time \
+--use_relative_action false \
+--relative_action_mask true,true,true,true,true,true,true,false
+
+
+CUDA_VISIBLE_DEVICES=1,2,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-node 6 vla-scripts/finetune.py \
+--vlm_path pretrained_models/prism-qwen25-extra-dinosiglip-224px-0_5b \
+--config_file_path pretrained_models/configs \
+--data_root_dir /mnt/lx/cyx/openvla/modified_libero_rlds \
+--dataset_name 'libero_10_no_noops' \
 --run_root_dir outputs \
 --use_film False \
 --num_images_in_input 2 \
@@ -49,14 +92,46 @@ CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-no
 --future_confidence_gamma 1.0 \
 --future_conf_loss_weight 0.1 \
 --pred_tokens_before_action False \
---future_pred_feature_dir /mnt/lx/cyx/lerobot/dinov3_features \
+--future_pred_feature_dir /mnt/lx/cyx/lerobot/dinov3_features/libero_10_no_noops \
 --future_pred_loss_weight 0.05 \
 --use_latency_conditioning False \
 --latency_steps_min 0 \
 --latency_steps_max 6 \
---run_id_note VLA-Adapter--remanipbench_rlds--pred--2frame--attn--mid_layer--$current_time \
+--run_id_note ReflexVLA--LIBERO--10--$current_time \
 --use_relative_action false \
 --relative_action_mask true,true,true,true,true,true,true,false
+
+
+# Local eval for the LIBERO Goal checkpoint trained with the config above.
+PYTHONPATH=/mnt/lx/cyx/VLA-Adapter:/mnt/lx/cyx/VLA-Adapter/LIBERO:$PYTHONPATH \
+MUJOCO_GL=egl \
+PYOPENGL_PLATFORM=egl \
+CUDA_VISIBLE_DEVICES=5 \
+python experiments/robot/libero/run_libero_eval.py \
+--pretrained_checkpoint outputs/configs+libero_10_no_noops+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--ReflexVLA--LIBERO--10----50000_chkpt \
+--task_suite_name libero_10 \
+--num_trials_per_task 50 \
+--num_open_loop_steps 8 \
+--use_l1_regression True \
+--use_minivlm True \
+--use_film False \
+--num_images_in_input 2 \
+--num_temporal_frames 2 \
+--temporal_frame_interval 1 \
+--temporal_fusion_type attention \
+--use_current_query_temporal_attention False \
+--use_mid_layer_temporal_fusion True \
+--use_proprio True \
+--center_crop True \
+--use_cuda_graph True \
+--use_pro_version True \
+--use_future_pred True \
+--pred_tokens_before_action False \
+--use_future_conf False \
+--run_id_note ReflexVLA--LIBERO--10--local-eval \
+--save_version ReflexVLA-LIBERO-10-local-eval
+
+
 
 
 
@@ -83,12 +158,11 @@ python policy_server.py \
 
 
 python policy_server.py \
-  --pretrained_checkpoint outputs/configs+rmbench+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--rmbench--pred--2frame--attn--mid_layer----60000_chkpt \
+  --pretrained_checkpoint outputs/configs+remanipbench_rlds+b8+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--remanipbench_rlds--pred--2frame--attn--mid_layer----120000_chkpt \
   --use_future_pred \
   --num_temporal_frames 2 \
   --temporal_fusion_type attention \
   --use_mid_layer_temporal_fusion \
-  --unnorm_key ballcatching_rlds \
   --use_cuda_graph \
   --host 0.0.0.0 \
   --port 8000
@@ -141,3 +215,41 @@ CUDA_VISIBLE_DEVICES=0 python vla-scripts/benchmark_inference_latency.py \
   --iters 100 \
   --batch_size 1 \
   --output_json logs/latency_benchmark.json-++
+
+
+
+
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
+--vlm_path pretrained_models/prism-qwen25-extra-dinosiglip-224px-0_5b \
+--config_file_path pretrained_models/configs \
+--data_root_dir /mnt/lx/cyx/lerobot/dataset \
+--dataset_name 'remanipbench_rlds' \
+--run_root_dir outputs \
+--use_film False \
+--num_images_in_input 2 \
+--num_temporal_frames 1 \
+--use_proprio True \
+--use_lora True \
+--use_fz False \
+--use_minivlm True \
+--image_aug True \
+--num_steps_before_decay 80000 \
+--max_steps 120005 \
+--save_freq 10000 \
+--save_latest_checkpoint_only False \
+--merge_lora_during_training True \
+--batch_size 16 \
+--grad_accumulation_steps 1 \
+--learning_rate 2e-4 \
+--lora_rank 64 \
+--use_pro_version True \
+--use_future_pred False \
+--use_future_conf False \
+--run_id_note VLA-Adapter--remanipbench_rlds--baseline--$current_time \
+--use_relative_action false
+
+python policy_server.py \
+  --pretrained_checkpoint outputs/configs+remanipbench_rlds+b16+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--remanipbench_rlds--baseline----100000_chkpt \
+  --host 0.0.0.0 \
+  --port 8000

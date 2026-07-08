@@ -94,6 +94,11 @@ class GenerateConfig:
     num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for inference
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
+    num_temporal_frames: int = 1                     # Number of temporal frames per camera view
+    temporal_frame_interval: int = 1                 # Interval between temporal frames in env steps
+    temporal_fusion_type: str = "attention"          # Temporal fusion: "attention" or "delta_mlp"
+    use_current_query_temporal_attention: bool = False
+    use_mid_layer_temporal_fusion: bool = False
     use_proprio: bool = True                         # Whether to include proprio state in input
     use_relative_action: bool = False                # If True, convert predicted deltas back to absolute actions
     relative_action_mask: Optional[str] = None        # Comma-separated bool mask, e.g. true,true,false
@@ -138,6 +143,8 @@ class GenerateConfig:
     confidence_threshold: float = 0.65               # First step below this confidence starts truncation.
     min_action_horizon: int = 2                      # Always keep at least this many action steps.
     confidence_cumulative_min: bool = True
+    use_cuda_graph: bool = False                     # If True, replay fixed-shape GPU inference with CUDA Graph
+    cuda_graph_warmup: int = 3                       # Warmup runs before CUDA Graph capture
     phase: str = "Inference"
 
 
@@ -150,10 +157,20 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    if cfg.num_temporal_frames < 1:
+        raise ValueError("num_temporal_frames must be >= 1.")
+    if cfg.temporal_frame_interval < 1:
+        raise ValueError("temporal_frame_interval must be >= 1.")
     if cfg.use_relative_action and cfg.relative_action_mask is None:
         raise ValueError("use_relative_action=True requires relative_action_mask.")
     if cfg.use_future_conf and not cfg.use_future_pred:
         raise ValueError("use_future_conf=True requires use_future_pred=True.")
+    if cfg.use_cuda_graph and not torch.cuda.is_available():
+        raise ValueError("use_cuda_graph requires CUDA.")
+    if cfg.use_cuda_graph and cfg.return_confidence:
+        raise ValueError("use_cuda_graph does not support return_confidence.")
+    if cfg.use_cuda_graph and not cfg.use_l1_regression:
+        raise ValueError("use_cuda_graph requires use_l1_regression=True.")
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -283,7 +300,21 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
 
 
 
-def prepare_observation(obs, resize_size):
+def _select_temporal_frames(history, num_temporal_frames: int, temporal_frame_interval: int):
+    """Return old-to-current frames, padding with the earliest available frame at episode start."""
+    frames = []
+    history_list = list(history)
+    for i in reversed(range(num_temporal_frames)):
+        offset = i * temporal_frame_interval
+        if offset < len(history_list):
+            frames.append(history_list[-1 - offset])
+        else:
+            frames.append(history_list[0])
+    return frames
+
+
+
+def prepare_observation(obs, resize_size, cfg: GenerateConfig, image_history, wrist_image_history):
     """Prepare observation for policy input."""
     # Get preprocessed images
     img = get_libero_image(obs)
@@ -293,10 +324,29 @@ def prepare_observation(obs, resize_size):
     img_resized = resize_image_for_policy(img, resize_size)
     wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
 
+    image_history.append(img_resized)
+    wrist_image_history.append(wrist_img_resized)
+
+    num_temporal_frames = int(cfg.num_temporal_frames)
+    if num_temporal_frames > 1:
+        full_image = _select_temporal_frames(
+            image_history,
+            num_temporal_frames,
+            int(cfg.temporal_frame_interval),
+        )
+        wrist_image = _select_temporal_frames(
+            wrist_image_history,
+            num_temporal_frames,
+            int(cfg.temporal_frame_interval),
+        )
+    else:
+        full_image = img_resized
+        wrist_image = wrist_img_resized
+
     # Prepare observations dict
     observation = {
-        "full_image": img_resized,
-        "wrist_image": wrist_img_resized,
+        "full_image": full_image,
+        "wrist_image": wrist_image,
         "state": np.concatenate(
             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
         ),
@@ -332,6 +382,7 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    cuda_graph_state=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -349,6 +400,9 @@ def run_episode(
                "{NUM_ACTIONS_CHUNK} constant defined in prismatic.vla.constants! For best performance (in terms of "
                "both speed and success rate), we recommend executing the full action chunk.")
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
+    temporal_history_len = (int(cfg.num_temporal_frames) - 1) * int(cfg.temporal_frame_interval) + 1
+    image_history = deque(maxlen=temporal_history_len)
+    wrist_image_history = deque(maxlen=temporal_history_len)
 
     # Setup
     t = 0
@@ -366,7 +420,7 @@ def run_episode(
                 continue
 
             # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
+            observation, img = prepare_observation(obs, resize_size, cfg, image_history, wrist_image_history)
             replay_images.append(img)
 
             # If action queue is empty, requery model
@@ -382,7 +436,8 @@ def run_episode(
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
-                    use_minivlm=cfg.use_minivlm
+                    use_minivlm=cfg.use_minivlm,
+                    cuda_graph_state=cuda_graph_state,
                 )
 
                 action_queue.extend(actions) 
@@ -435,6 +490,7 @@ def run_task(
 
     # Initialize environment and get task description
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+    cuda_graph_state = {"runner": None} if cfg.use_cuda_graph else None
 
     # Start episodes
     task_episodes, task_successes = 0, 0
@@ -473,6 +529,7 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            cuda_graph_state,
         )
 
         # Update counters
